@@ -239,9 +239,12 @@ static HANDLE        g_scan_shutdown   = NULL; /* DLL_PROCESS_DETACH'ta sinyalle
 static HANDLE        g_scan_thread     = NULL; /* thread tamamlanana kadar join için */
 
 /* Anlık tarama thread'leri — detach'ta join etmek için */
-#define MAX_IMM_THREADS 3
+#define MAX_IMM_THREADS 8
 static HANDLE g_imm_threads[MAX_IMM_THREADS];
 static volatile LONG g_imm_thread_cnt = 0;
+
+/* İlk send scan sayacı — ilk 2 game-server send'de anında tarama */
+static volatile LONG g_send_scan_count = 0;
 
 /* run_one_pass() paylaşılan tampon yarış koruması */
 static CRITICAL_SECTION g_scan_cs;
@@ -261,9 +264,10 @@ static void ensure_init(void);
  * Ses PCM bufferlarda üst 16 bit=0 →256 kez tekrar → elenir.
  */
 static BOOL sbox_strict(const uint32_t *sbox) {
-    uint8_t h0[256], h1[256], h2[256], h3[256];
-    memset(h0,0,256); memset(h1,0,256);
-    memset(h2,0,256); memset(h3,0,256);
+    /* uint16_t — uint8_t wraps at 256 (e.g. all-zero sbox passes incorrectly) */
+    uint16_t h0[256], h1[256], h2[256], h3[256];
+    memset(h0,0,sizeof(h0)); memset(h1,0,sizeof(h1));
+    memset(h2,0,sizeof(h2)); memset(h3,0,sizeof(h3));
 
     for (int i = 0; i < 256; i++) {
         uint32_t v = sbox[i];
@@ -273,7 +277,7 @@ static BOOL sbox_strict(const uint32_t *sbox) {
         h3[(uint8_t)(v      )]++;
     }
     for (int b = 0; b < 256; b++) {
-        if (h0[b] > 7 || h1[b] > 7 || h2[b] > 7 || h3[b] > 7)
+        if (h0[b] > 16 || h1[b] > 16 || h2[b] > 16 || h3[b] > 16)
             return FALSE;
     }
     return TRUE;
@@ -320,9 +324,9 @@ static void log_bf_candidate(FILE *f, int num, const void *addr,
 static int run_one_pass(FILE *f, int pass_num) {
     int candidates = 0, pages = 0;
 
-    /* Sadece oyun özel belleği: 1 MB – 1 GB arası */
+    /* Tüm kullanıcı alanı: 1 MB – 2 GB (VMP image bölgelerini de kapsar) */
     uint8_t *scan_lo = (uint8_t *)0x00100000;
-    uint8_t *scan_hi = (uint8_t *)0x40000000;
+    uint8_t *scan_hi = (uint8_t *)0x7FFFFFFF;
 
     MEMORY_BASIC_INFORMATION mbi;
     uint8_t *addr = scan_lo;
@@ -367,8 +371,11 @@ static int run_one_pass(FILE *f, int pass_num) {
              * olabilir ancak tampon hep 16 MB; büyük bölgeleri 16 MB
              * parçalara bölerek tara.
              */
-            static uint8_t tmp[16 * 1024 * 1024];
-            const size_t CHUNK = sizeof(tmp);
+            /* Heap allocation — static buffer causes data race when scan threads run concurrently */
+            const size_t CHUNK = 16u * 1024u * 1024u;
+            uint8_t *tmp = (uint8_t *)VirtualAlloc(NULL, CHUNK, MEM_COMMIT | MEM_RESERVE,
+                                                    PAGE_READWRITE);
+            if (!tmp) { addr = next; continue; }
 
             for (size_t chunk_off = 0; chunk_off < rsz; chunk_off += CHUNK) {
                 size_t to_read = rsz - chunk_off;
@@ -397,11 +404,16 @@ static int run_one_pass(FILE *f, int pass_num) {
                 if (!sbox_strict(dw + BF_P_DWORDS + 768)) continue;
 
                 candidates++;
-                log_bf_candidate(f, candidates, base + off, &mbi, dw);
+                /* g_scan_cs ile atomik log yazımı — çoklu thread log karışmasını önler */
+                EnterCriticalSection(&g_scan_cs);
+                log_bf_candidate(f, candidates, base + chunk_off + off, &mbi, dw);
+                LeaveCriticalSection(&g_scan_cs);
 
                 off += BF_KEY_SIZE - 4;  /* örtüşen eşleşmeleri atla */
             }
         }
+            VirtualFree(tmp, 0, MEM_RELEASE);
+        }  /* if (mbi.State == MEM_COMMIT ...) */
         addr = next;
     }
 
@@ -509,7 +521,24 @@ static int WINAPI hook_connect(SOCKET s,
         uint16_t port = ntohs(((const struct sockaddr_in *)name)->sin_port);
         if (port != 80 && port != 443 && port != 53 && port > 1024) {
             ensure_init();
-            trigger_memscan();
+            trigger_memscan();  /* gecikmeli (t+200ms) tarama */
+        }
+        /* Port 39190: key exchange connect() SONRASI hemen gerçekleşir —
+         * recv hook'tan önce anında tarama başlat */
+        if (port == GAME_PORT) {
+            if (g_log_crypto) {
+                log_time(g_log_crypto);
+                fprintf(g_log_crypto,
+                    "*** GAME PORT %u CONNECT — ANINDA TARAMA (connect hook) ***\n",
+                    GAME_PORT);
+                fflush(g_log_crypto);
+            }
+            HANDLE t = CreateThread(NULL, 0, immediate_scan_thread, NULL, 0, NULL);
+            if (t) {
+                LONG idx = InterlockedIncrement(&g_imm_thread_cnt) - 1;
+                if (idx < MAX_IMM_THREADS) g_imm_threads[idx] = t;
+                else CloseHandle(t);
+            }
         }
     }
 
@@ -519,6 +548,35 @@ static int WINAPI hook_connect(SOCKET s,
 /* ── HOOK: send (TCP) ── */
 static int WINAPI hook_send(SOCKET s, const char *buf, int len, int flags) {
     int ret = ((fn_send_t)d_send.orig_fn)(s, buf, len, flags);
+
+    /* İlk 2 game-server send'de anında tarama — key, send() çağrısından
+     * ÖNCE kurulmuş olması ZORUNLU (şifreli veri hazır). Bu en güvenilir
+     * tarama noktasıdır. */
+    if (ret > 0) {
+        struct sockaddr_in sa; int sl = sizeof(sa);
+        if (getpeername(s, (struct sockaddr*)&sa, &sl) == 0) {
+            uint16_t port = ntohs(sa.sin_port);
+            if (port == GAME_PORT) {
+                LONG cnt = InterlockedIncrement(&g_send_scan_count);
+                if (cnt <= 2) {
+                    if (g_log_crypto) {
+                        log_time(g_log_crypto);
+                        fprintf(g_log_crypto,
+                            "*** GAME PORT %u SEND #%ld — ANINDA TARAMA (send hook) ***\n",
+                            GAME_PORT, (long)cnt);
+                        fflush(g_log_crypto);
+                    }
+                    HANDLE t = CreateThread(NULL, 0, immediate_scan_thread, NULL, 0, NULL);
+                    if (t) {
+                        LONG idx = InterlockedIncrement(&g_imm_thread_cnt) - 1;
+                        if (idx < MAX_IMM_THREADS) g_imm_threads[idx] = t;
+                        else CloseHandle(t);
+                    }
+                }
+            }
+        }
+    }
+
     if (g_log_net && ret > 0) {
         char peer[64];
         socket_peer(s, peer, sizeof(peer));
@@ -548,7 +606,12 @@ static int WINAPI hook_recv(SOCKET s, char *buf, int len, int flags) {
                 LONG cnt = InterlockedIncrement(&g_recv_scan_count);
                 if (cnt <= 3) {
                     HANDLE t = CreateThread(NULL, 0, immediate_scan_thread, NULL, 0, NULL);
-                    if (t) CloseHandle(t);  /* detached — join gerekmez */
+                    if (t) {
+                        /* Store handle for safe join at DLL_PROCESS_DETACH */
+                        LONG idx = InterlockedIncrement(&g_imm_thread_cnt) - 1;
+                        if (idx < MAX_IMM_THREADS) g_imm_threads[idx] = t;
+                        else CloseHandle(t);
+                    }
                 }
                 if (cnt == 1) {
                     InterlockedExchange(&g_game_socket_seen, 1);
@@ -1024,6 +1087,10 @@ static BOOL CALLBACK do_init(PINIT_ONCE p, PVOID param, PVOID *ctx) {
     /* Tarama thread'i için graceful shutdown event'i oluştur */
     g_scan_shutdown = CreateEventA(NULL, TRUE, FALSE, NULL);
 
+    /* Paylaşılan tampon için kritik bölüm başlat */
+    InitializeCriticalSection(&g_scan_cs);
+    g_scan_cs_init = TRUE;
+
     /* OpenSSL inline detour'ları kur (BF_set_key → session key yakalama) */
     install_crypto_hooks();
 
@@ -1214,6 +1281,19 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD reason, LPVOID reserved) {
             CloseHandle(g_scan_shutdown);
             g_scan_shutdown = NULL;
         }
+        /* Join immediate scan threads so they don't write to closed logs */
+        {
+            LONG cnt = g_imm_thread_cnt;
+            if (cnt > MAX_IMM_THREADS) cnt = MAX_IMM_THREADS;
+            for (LONG i = 0; i < cnt; i++) {
+                if (g_imm_threads[i]) {
+                    WaitForSingleObject(g_imm_threads[i], 2000);
+                    CloseHandle(g_imm_threads[i]);
+                    g_imm_threads[i] = NULL;
+                }
+            }
+        }
+        if (g_scan_cs_init) { DeleteCriticalSection(&g_scan_cs); g_scan_cs_init = FALSE; }
         if (g_log_crypto) {
             fprintf(g_log_crypto, "proxy kaldirildi.\n");
             fclose(g_log_crypto); g_log_crypto = NULL;

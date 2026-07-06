@@ -51,10 +51,15 @@ def bf_encrypt_block(P: list, S: list, xl: int, xr: int) -> tuple:
     xl ^= P[17]
     return xl & 0xFFFFFFFF, xr & 0xFFFFFFFF
 
-def keystream_from_key(P: list, S: list) -> bytes:
-    """IV=0 ile BF_encrypt(0, 0) → 8-byte keystream."""
+def keystream_from_key(P: list, S: list, le: bool = False) -> bytes:
+    """IV=0 ile BF_encrypt(0, 0) → 8-byte keystream.
+    le=False → OpenSSL l2n/n2l yolu: big-endian (standart).
+    le=True  → union uc[] yolu: little-endian per 32-bit word.
+               Game'in custom implementasyonu bunu kullanıyor olabilir.
+    """
     xl, xr = bf_encrypt_block(P, S, 0, 0)
-    return xl.to_bytes(4, 'big') + xr.to_bytes(4, 'big')
+    order = 'little' if le else 'big'
+    return xl.to_bytes(4, order) + xr.to_bytes(4, order)
 
 # ─── pb_crypto.log ayrıştırıcı ─────────────────────────────────────────────
 
@@ -237,44 +242,111 @@ def p_array_plausible(P: list) -> bool:
         return False
     return True
 
+# ─── Alternatif yerleşim yorumları ─────────────────────────────────────────
+
+def candidate_layouts(cand: dict) -> list:
+    """
+    Aynı ham bellek penceresini farklı BF_KEY yerleşim yorumlarıyla dene.
+
+    Desteklenen yerleşimler:
+    ┌─────────────────────────────────────────────────────────────────────┐
+    │ P-first (OpenSSL varsayılan):  P[18] | S0[256] | S1[256] | S2[256] │S3[256]
+    │ S-first (bazı özel impl.): S0[256] | S1[256] | S2[256] | S3[256] | P[18]
+    └─────────────────────────────────────────────────────────────────────┘
+
+    Log'daki ham dword dizisi (toplam 1042 dword = 4168 byte):
+      all_dw = P_log(18) + S0_log(256) + S1_log(256) + S2_log(256) + S3_log(256)
+
+    S-first yorumu (S-boxlar önce, P-array sonda):
+      true_S0 = all_dw[0:256]
+      true_S1 = all_dw[256:512]
+      true_S2 = all_dw[512:768]
+      true_S3 = all_dw[768:1024]
+      true_P  = all_dw[1024:1042]
+
+    Döndürür: [{'label': str, 'P': list, 'S': list}, ...]
+    """
+    P_log = cand['P']                     # 18 dwords
+    S_log = cand['S']                     # 4 × 256 dwords
+
+    layouts = []
+
+    # 1. P-first (mevcut yorumlama)
+    layouts.append({
+        'label': 'P-first',
+        'P': P_log,
+        'S': S_log,
+    })
+
+    # 2. S-first — raw pencereyi tek dizi olarak yeniden yorumla
+    all_dw = P_log + S_log[0] + S_log[1] + S_log[2] + S_log[3]
+    # all_dw uzunluğu: 18+256+256+256+256 = 1042
+    if len(all_dw) == 1042:
+        layouts.append({
+            'label': 'S-first',
+            'P': all_dw[1024:1042],
+            'S': [
+                all_dw[0:256],
+                all_dw[256:512],
+                all_dw[512:768],
+                all_dw[768:1024],
+            ],
+        })
+
+    return layouts
+
+
 # ─── Ana doğrulama ─────────────────────────────────────────────────────────
 
 def verify_candidates(candidates: list, ks_check: bytes,
                       verbose: bool = False) -> list:
     """
-    Her aday için BF_encrypt(0, 0) hesapla ve keystream ile karşılaştır.
+    Her aday için birden fazla bellek yerleşimi yorumuyla BF_encrypt(0, 0)
+    hesapla ve keystream ile karşılaştır.
     Döndürür: eşleşen aday listesi
     """
     matches = []
     total = len(candidates)
     filtered_p = 0
+    tested = 0
 
     for idx, cand in enumerate(candidates):
-        # Hızlı P-array filtresi
-        if not p_array_plausible(cand['P']):
-            filtered_p += 1
-            continue
+        layouts = candidate_layouts(cand)
 
-        P = cand['P']
-        S = cand['S']
+        any_tested = False
+        for layout in layouts:
+            P = layout['P']
+            S = layout['S']
 
-        ks = keystream_from_key(P, S)
+            # Hızlı P-array filtresi (P-first için anlamlı, S-first için
+            # true_P rastgele görünür — atla sadece P-first'te)
+            if layout['label'] == 'P-first' and not p_array_plausible(P):
+                filtered_p += 1
+                continue
 
-        if verbose:
-            print(f"  #{cand['num']:4d}  addr={cand['addr']}  "
-                  f"ks={ks.hex()}  check={ks_check.hex()}")
+            any_tested = True
+            tested += 1
+            ks = keystream_from_key(P, S)
 
-        # Keystream eşleşme kontrolü (ks_check kadar bayt karşılaştır)
-        if ks[:len(ks_check)] == ks_check:
-            matches.append({**cand, 'keystream': ks})
-        elif verbose:
-            # Near-miss debug: ks[0] doğru ama sonraki farklı
-            if ks[0] == ks_check[0]:
-                print(f"    ⚠ near-miss #{cand['num']}: ks={ks.hex()}")
+            if verbose:
+                print(f"  #{cand['num']:4d}  {layout['label']}  addr={cand['addr']}  "
+                      f"ks={ks.hex()}  check={ks_check.hex()}")
+
+            # Keystream eşleşme kontrolü
+            if ks[:len(ks_check)] == ks_check:
+                matches.append({
+                    **cand,
+                    'keystream': ks,
+                    'layout': layout['label'],
+                    'matched_P': P,
+                    'matched_S': S,
+                })
+            elif verbose and ks[0] == ks_check[0]:
+                print(f"    ⚠ near-miss #{cand['num']} [{layout['label']}]: ks={ks.hex()}")
 
     print(f"\n  Toplam aday       : {total}")
-    print(f"  P-array filtresi  : {filtered_p} elendi")
-    print(f"  Blowfish test     : {total - filtered_p} denendi")
+    print(f"  P-array filtresi  : {filtered_p} elendi (yalnızca P-first)")
+    print(f"  Blowfish test     : {tested}")
     print(f"  Eşleşen           : {len(matches)}")
     return matches
 
@@ -282,17 +354,20 @@ def verify_candidates(candidates: list, ks_check: bytes,
 
 def print_match(cand: dict) -> None:
     ks = cand.get('keystream', b'')
+    layout = cand.get('layout', 'P-first')
+    P = cand.get('matched_P', cand['P'])
     print(f"\n{'='*64}")
-    print(f"✅  DOĞRULANDI — BF_KEY ADAYI #{cand['num']}")
+    print(f"✅  DOĞRULANDI — BF_KEY ADAYI #{cand['num']}  [{layout}]")
     print(f"{'='*64}")
     print(f"  Bellek adresi : 0x{cand['addr']}")
     print(f"  Geçiş         : {cand['pass']}")
+    print(f"  Yerleşim      : {layout}")
     print(f"  Keystream[0:8]: {ks.hex()}")
     print(f"  P-array (18×4B):")
-    for i, v in enumerate(cand['P']):
+    for i, v in enumerate(P):
         print(f"    P[{i:2d}] = 0x{v:08X}")
     print(f"  [FULL_KEY] P:", end='')
-    for v in cand['P']:
+    for v in P:
         print(f'{v:08x}', end='')
     print()
     print(f"{'='*64}")
@@ -380,12 +455,15 @@ def main():
         out = Path(args.dump)
         with out.open('w') as f:
             for m in matches:
-                f.write(f"ADAYI #{m['num']}  addr=0x{m['addr']}  geçiş={m['pass']}\n")
+                # matched_P/matched_S: doğru yerleşim (S-first ise true_P/true_S)
+                P_out = m.get('matched_P', m['P'])
+                S_out = m.get('matched_S', m['S'])
+                f.write(f"ADAYI #{m['num']}  addr=0x{m['addr']}  geçiş={m['pass']}  yerleşim={m.get('layout','P-first')}\n")
                 f.write(f"keystream : {m.get('keystream', b'').hex()}\n")
-                f.write(f"P         : {''.join(f'{v:08x}' for v in m['P'])}\n")
+                f.write(f"P         : {''.join(f'{v:08x}' for v in P_out)}\n")
                 for sn in range(4):
                     f.write(f"S[{sn}]      : "
-                            + ''.join(f'{v:08x}' for v in m['S'][sn]) + '\n')
+                            + ''.join(f'{v:08x}' for v in S_out[sn]) + '\n')
                 f.write('\n')
         print(f"\n💾  Sonuç yazıldı: {out}")
 
