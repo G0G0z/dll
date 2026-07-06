@@ -73,6 +73,15 @@ static void log_hex(FILE *f, const char *label,
     fprintf(f, "\n");
 }
 
+/* Kesimsiz hex dump — S-box tam logu (1024B) için */
+static void log_hex_full(FILE *f, const char *label,
+                         const unsigned char *buf, int len) {
+    if (!f || !buf || len <= 0) return;
+    fprintf(f, "  %-30s [%d bytes]: ", label, len);
+    for (int i = 0; i < len; i++) fprintf(f, "%02x", buf[i]);
+    fprintf(f, "\n");
+}
+
 static void log_time(FILE *f) {
     if (!f) return;
     SYSTEMTIME st;
@@ -223,9 +232,24 @@ static Detour d_RSA_public_inline;  /* RSA ile şifrelenmeden önce */
 #define BF_INIT_P0    0x243f6a88u
 
 /* Tarama durumu */
-static volatile LONG g_scan_triggered = 0;
-static volatile LONG g_scan_running   = 0;
-static HANDLE        g_scan_shutdown  = NULL;  /* DLL_PROCESS_DETACH'ta sinyallenir */
+static volatile LONG g_scan_triggered  = 0;   /* başlangıç thread'i başlatıldı mı */
+static volatile LONG g_scan_running    = 0;
+static volatile LONG g_recv_scan_count = 0;   /* recv-hook tetiklemesi sayacı */
+static HANDLE        g_scan_shutdown   = NULL; /* DLL_PROCESS_DETACH'ta sinyallenir */
+static HANDLE        g_scan_thread     = NULL; /* thread tamamlanana kadar join için */
+
+/* Anlık tarama thread'leri — detach'ta join etmek için */
+#define MAX_IMM_THREADS 3
+static HANDLE g_imm_threads[MAX_IMM_THREADS];
+static volatile LONG g_imm_thread_cnt = 0;
+
+/* run_one_pass() paylaşılan tampon yarış koruması */
+static CRITICAL_SECTION g_scan_cs;
+static BOOL             g_scan_cs_init = FALSE;
+
+/* Socket → port 39190 mu? (sadece game server trafiği için anlık tarama) */
+#define GAME_PORT 39190u
+static volatile LONG g_game_socket_seen = 0;  /* game server recv görüldü mü */
 
 /* Forward declaration */
 static void ensure_init(void);
@@ -273,10 +297,17 @@ static void log_bf_candidate(FILE *f, int num, const void *addr,
     log_hex(f, "P-array", (const uint8_t*)dw, BF_P_DWORDS * 4);
 
     /* TAM S-box'lar (4 × 1024 byte) — Python doğrulama için gerekli */
-    log_hex(f, "S[0] (1024B)", (const uint8_t*)(dw + BF_P_DWORDS),               1024);
-    log_hex(f, "S[1] (1024B)", (const uint8_t*)(dw + BF_P_DWORDS + 256),         1024);
-    log_hex(f, "S[2] (1024B)", (const uint8_t*)(dw + BF_P_DWORDS + 512),         1024);
-    log_hex(f, "S[3] (1024B)", (const uint8_t*)(dw + BF_P_DWORDS + 768),         1024);
+    log_hex_full(f, "S[0] (1024B)", (const uint8_t*)(dw + BF_P_DWORDS),               1024);
+    log_hex_full(f, "S[1] (1024B)", (const uint8_t*)(dw + BF_P_DWORDS + 256),         1024);
+    log_hex_full(f, "S[2] (1024B)", (const uint8_t*)(dw + BF_P_DWORDS + 512),         1024);
+    log_hex_full(f, "S[3] (1024B)", (const uint8_t*)(dw + BF_P_DWORDS + 768),         1024);
+
+    /* Hızlı imza (verify_key.py için — her S-box'ın ilk 4 dword'u LE) */
+    fprintf(f, "  [SIG] S0_0=%08x S1_0=%08x S2_0=%08x S3_0=%08x\n",
+            dw[BF_P_DWORDS],
+            dw[BF_P_DWORDS + 256],
+            dw[BF_P_DWORDS + 512],
+            dw[BF_P_DWORDS + 768]);
 
     /* Tek satır P-array (Python kopyala/yapıştır için) */
     fprintf(f, "  [FULL_KEY] P:");
@@ -306,24 +337,49 @@ static int run_one_pass(FILE *f, int pass_num) {
         uint8_t *next = base + rsz;
         if (next <= base) break;
 
-        /* Filtre: commit, özel, R/W, Guard değil, boyut uygun */
-        if (mbi.State   == MEM_COMMIT              &&
-            mbi.Type    == MEM_PRIVATE             &&
+        /*
+         * Filtre: commit, R/W veya RWX, Guard değil, boyut uygun.
+         *
+         * MEM_PRIVATE : heap/stack — önceki sürüm, artık yetersiz
+         * MEM_IMAGE   : VMProtect sanallaştırılmış bölgeleri buraya yazar;
+         *               oyunun statik Blowfish context'i genellikle burada
+         * MEM_MAPPED  : mapped file/section, gerekirse dahil edilebilir
+         *
+         * MEM_IMAGE için boyut üst sınırı 64 MB (VMP section'lar büyük olabilir).
+         */
+        BOOL is_private = (mbi.Type == MEM_PRIVATE);
+        BOOL is_image   = (mbi.Type == MEM_IMAGE);
+        size_t max_rsz  = is_image ? 64u*1024u*1024u : 16u*1024u*1024u;
+
+        if (mbi.State   == MEM_COMMIT                          &&
+            (is_private || is_image)                           &&
             (mbi.Protect & (PAGE_READWRITE |
-                            PAGE_EXECUTE_READWRITE)) &&
-            !(mbi.Protect & PAGE_GUARD)            &&
-            rsz         >= (size_t)BF_KEY_SIZE     &&
-            rsz         <= 16u * 1024u * 1024u) {  /* max 16 MB */
+                            PAGE_EXECUTE_READWRITE |
+                            PAGE_EXECUTE_READ))                &&
+            !(mbi.Protect & PAGE_GUARD)                        &&
+            rsz         >= (size_t)BF_KEY_SIZE                 &&
+            rsz         <= max_rsz) {
 
             pages++;
 
-            /* Tampon yeterince büyükse doğrudan oku */
+            /*
+             * Sabit boyutlu tampon — MEM_IMAGE bölgeleri 64 MB'a kadar
+             * olabilir ancak tampon hep 16 MB; büyük bölgeleri 16 MB
+             * parçalara bölerek tara.
+             */
             static uint8_t tmp[16 * 1024 * 1024];
-            SIZE_T copied = 0;
-            if (!ReadProcessMemory(GetCurrentProcess(),
-                                   base, tmp, rsz, &copied) || copied < BF_KEY_SIZE) {
-                addr = next; continue;
-            }
+            const size_t CHUNK = sizeof(tmp);
+
+            for (size_t chunk_off = 0; chunk_off < rsz; chunk_off += CHUNK) {
+                size_t to_read = rsz - chunk_off;
+                if (to_read > CHUNK) to_read = CHUNK;
+
+                SIZE_T copied = 0;
+                if (!ReadProcessMemory(GetCurrentProcess(),
+                                       base + chunk_off, tmp, to_read, &copied)
+                    || copied < (size_t)BF_KEY_SIZE) {
+                    continue;
+                }
 
             for (size_t off = 0; off + BF_KEY_SIZE <= copied; off += 4) {
                 const uint32_t *dw = (const uint32_t *)(tmp + off);
@@ -359,11 +415,26 @@ static int run_one_pass(FILE *f, int pass_num) {
 static DWORD WINAPI scan_thread(LPVOID param) {
     (void)param;
 
-    /* 3 geçiş: login key (1s) + game server key (5s) + yedek (10s) */
-    static const DWORD delays[] = {1000, 5000, 10000};
+    /*
+     * Genişletilmiş tarama takvimi:
+     *   GEÇİŞ 1 : 200 ms   — mümkün olan en erken
+     *   GEÇİŞ 2 : 1000 ms  — login key penceresi
+     *   GEÇİŞ 3 : 3000 ms  — handshake gecikmesi
+     *   GEÇİŞ 4 : 6000 ms  — game server key
+     *   GEÇİŞ 5 : 12000 ms — yedek (sunucu geç cevaplayabilir)
+     *   GEÇİŞ 6 : 20000 ms — son şans
+     */
+    static const DWORD delays[] = {200, 1000, 3000, 6000, 12000, 20000};
+    static const int   NPASS    = 6;
 
-    for (int pass = 0; pass < 3; pass++) {
-        Sleep(delays[pass]);
+    for (int pass = 0; pass < NPASS; pass++) {
+        /* Hem bekleme hem erken çıkış: DLL kaldırılırsa shutdown sinyali gelir */
+        if (g_scan_shutdown) {
+            DWORD wr = WaitForSingleObject(g_scan_shutdown, delays[pass]);
+            if (wr == WAIT_OBJECT_0 || wr == WAIT_FAILED) break;
+        } else {
+            Sleep(delays[pass]);
+        }
 
         FILE *f = g_log_crypto;
         FILE *fb = NULL;
@@ -376,7 +447,8 @@ static DWORD WINAPI scan_thread(LPVOID param) {
         if (!f) continue;
 
         log_time(f);
-        fprintf(f, "\n=== BELLEK TARAMASI v2 — GEÇİŞ %d ===\n", pass + 1);
+        fprintf(f, "\n=== BELLEK TARAMASI v2 — GEÇİŞ %d (t+%lums) ===\n",
+                pass + 1, (unsigned long)delays[pass]);
         fflush(f);
 
         run_one_pass(f, pass + 1);
@@ -388,12 +460,34 @@ static DWORD WINAPI scan_thread(LPVOID param) {
     return 0;
 }
 
+/* Anında (0-delay) tek tarama — recv hook'tan tetiklenir */
+static DWORD WINAPI immediate_scan_thread(LPVOID param) {
+    (void)param;
+    FILE *f = g_log_crypto;
+    FILE *fb = NULL;
+    if (!f) {
+        char path[MAX_PATH];
+        make_path(path, "pb_key_fallback.log");
+        fb = fopen(path, "a");
+        f = fb;
+    }
+    if (f) {
+        log_time(f);
+        fprintf(f, "\n=== BELLEK TARAMASI v2 — ANİ TARAMA (recv hook) ===\n");
+        fflush(f);
+        run_one_pass(f, 99);
+        if (fb) { fclose(fb); }
+    }
+    return 0;
+}
+
 /* Oyun sunucusuna bağlanınca taramayı bir kere tetikle */
 static void trigger_memscan(void) {
     if (InterlockedCompareExchange(&g_scan_triggered, 1, 0) == 0) {
         InterlockedExchange(&g_scan_running, 1);
+        /* Handle'ı kapat MA — detach sırasında join için sakla */
         HANDLE t = CreateThread(NULL, 0, scan_thread, NULL, 0, NULL);
-        if (t) CloseHandle(t);
+        if (t) g_scan_thread = t;
         else   InterlockedExchange(&g_scan_running, 0);
     }
 }
@@ -440,14 +534,42 @@ static int WINAPI hook_send(SOCKET s, const char *buf, int len, int flags) {
 /* ── HOOK: recv (TCP) ── */
 static int WINAPI hook_recv(SOCKET s, char *buf, int len, int flags) {
     int ret = ((fn_recv_t)d_recv.orig_fn)(s, buf, len, flags);
-    if (g_log_net && ret > 0) {
+    if (ret > 0) {
+        /* Game server recv → anında bellek taraması (sadece bir kez) */
         char peer[64];
         socket_peer(s, peer, sizeof(peer));
-        log_time(g_log_net);
-        fprintf(g_log_net, "TCP RECV ← %-22s  bf_calls=%ld  ",
-                peer, (long)g_bf_export_calls);
-        log_hex(g_log_net, "", (const unsigned char*)buf, ret);
-        fflush(g_log_net);
+
+        /* "31.169.73." veya port 39190 kontrolü */
+        struct sockaddr_in sa; int sl = sizeof(sa);
+        if (getpeername(s, (struct sockaddr*)&sa, &sl) == 0) {
+            uint16_t port = ntohs(sa.sin_port);
+            if (port == GAME_PORT) {
+                /* İlk 3 game-server recv'de anında tarama yap */
+                LONG cnt = InterlockedIncrement(&g_recv_scan_count);
+                if (cnt <= 3) {
+                    HANDLE t = CreateThread(NULL, 0, immediate_scan_thread, NULL, 0, NULL);
+                    if (t) CloseHandle(t);  /* detached — join gerekmez */
+                }
+                if (cnt == 1) {
+                    InterlockedExchange(&g_game_socket_seen, 1);
+                    if (g_log_crypto) {
+                        log_time(g_log_crypto);
+                        fprintf(g_log_crypto,
+                            "*** PORT %u RECV ALGILANDI — ANI TARAMA TETIKLENIYOR ***\n",
+                            GAME_PORT);
+                        fflush(g_log_crypto);
+                    }
+                }
+            }
+        }
+
+        if (g_log_net) {
+            log_time(g_log_net);
+            fprintf(g_log_net, "TCP RECV ← %-22s  bf_calls=%ld  ",
+                    peer, (long)g_bf_export_calls);
+            log_hex(g_log_net, "", (const unsigned char*)buf, ret);
+            fflush(g_log_net);
+        }
     }
     return ret;
 }
@@ -877,7 +999,11 @@ static BOOL CALLBACK do_init(PINIT_ONCE p, PVOID param, PVOID *ctx) {
         fflush(g_log_crypto);
     }
     if (g_real_crypto) {
-#define LOAD(name) real_##name = (fn_##name)GetProcAddress(g_real_crypto, #name)
+/* void* ara cast — GetProcAddress dönüşüm uyarısını bastırır */
+#define LOAD(name) do { \
+    void *_p = (void*)(uintptr_t)GetProcAddress(g_real_crypto, #name); \
+    memcpy(&real_##name, &_p, sizeof(_p)); \
+} while(0)
         LOAD(BF_set_key); LOAD(BF_cfb64_encrypt);
         LOAD(BF_encrypt); LOAD(BF_decrypt);
         LOAD(RSA_public_encrypt);
@@ -894,6 +1020,9 @@ static BOOL CALLBACK do_init(PINIT_ONCE p, PVOID param, PVOID *ctx) {
             fflush(g_log_crypto);
         }
     }
+
+    /* Tarama thread'i için graceful shutdown event'i oluştur */
+    g_scan_shutdown = CreateEventA(NULL, TRUE, FALSE, NULL);
 
     /* OpenSSL inline detour'ları kur (BF_set_key → session key yakalama) */
     install_crypto_hooks();
@@ -1073,6 +1202,18 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD reason, LPVOID reserved) {
         DisableThreadLibraryCalls(hinstDLL);
         /* Ağır iş ensure_init() ile lazy yapılır */
     } else if (reason == DLL_PROCESS_DETACH) {
+        /* Tarama thread'ini durdur */
+        if (g_scan_shutdown) {
+            SetEvent(g_scan_shutdown);
+            /* Thread tamamen bitmeden log handle'larını kapatma */
+            if (g_scan_thread) {
+                WaitForSingleObject(g_scan_thread, 2000);  /* en fazla 2s bekle */
+                CloseHandle(g_scan_thread);
+                g_scan_thread = NULL;
+            }
+            CloseHandle(g_scan_shutdown);
+            g_scan_shutdown = NULL;
+        }
         if (g_log_crypto) {
             fprintf(g_log_crypto, "proxy kaldirildi.\n");
             fclose(g_log_crypto); g_log_crypto = NULL;

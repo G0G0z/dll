@@ -1,23 +1,24 @@
 # libcrypto-1_1.dll Proxy — Makefile
 # Replit'te derlemek için: make
 # Çıktı: libcrypto-1_1.dll (Windows 32-bit)
+#
+# Derleme aracı: Zig (cross-compile, Windows x86)
 
-CC      = i686-w64-mingw32-gcc
-CFLAGS  = -Wall -O2 -shared -m32
-LDFLAGS = -Wl,--kill-at -Wl,--enable-stdcall-fixup
-
+ZIG     = zig
 TARGET  = libcrypto-1_1.dll
 SRC     = libcrypto_proxy.c
-DEF     = libcrypto_proxy.def
 
 .PHONY: all clean
 
 all: $(TARGET)
 
-$(TARGET): $(SRC) $(DEF)
-	$(CC) $(CFLAGS) -o $(TARGET) $(SRC) $(DEF) $(LDFLAGS)
+$(TARGET): $(SRC) libcrypto_proxy.def
+	$(ZIG) cc -target x86-windows-gnu -shared -O2 \
+	    -o $(TARGET) $(SRC) \
+	    -lkernel32 -lws2_32
 	@echo ""
-	@echo "Derleme tamam: $(TARGET)"
+	@echo "✓ Derleme tamam: $(TARGET)"
+	@ls -lh $(TARGET)
 	@echo ""
 	@echo "Kurulum adımları:"
 	@echo "  1. Oyunun dizinindeki libcrypto-1_1.dll -> libcrypto-1_1_orig.dll yeniden adlandır"
