@@ -44,6 +44,9 @@ typedef void BIO;
 static FILE *g_log_crypto = NULL;   /* pb_crypto.log */
 static FILE *g_log_net    = NULL;   /* pb_net.log    */
 
+/* Diagnostic: counts every BF export call — visible in pb_net.log lines */
+static volatile LONG g_bf_export_calls = 0;
+
 static INIT_ONCE  g_init        = INIT_ONCE_STATIC_INIT;
 static HMODULE    g_real_crypto  = NULL;
 
@@ -193,6 +196,208 @@ static Detour d_BF_set_key;         /* ALTIN: ham session key buraya gelir */
 static Detour d_BF_cfb64_inline;    /* her encrypt/decrypt çağrısı */
 static Detour d_RSA_public_inline;  /* RSA ile şifrelenmeden önce */
 
+/* ══════════════════════════════════════════════════════
+ *  BLOWFISH KEY — BELLEK TARAMA MOTORu  v2
+ *
+ *  Sorun: eski sürüm grafik/ses buffer'larını yanlış
+ *  pozitif olarak işaretliyordu (12 K+ sonuç).
+ *
+ *  v2 iyileştirmeleri:
+ *   1. Adres aralığı filtresi: sadece 0x00100000–0x3FFFFFFF
+ *      (oyun heap/data; DLL bölgeleri ve grafik belleği dışarıda)
+ *   2. Bölge boyutu sınırı: >16 MB bölgeler atlanır
+ *   3. Sıkı S-box testi: her 4 byte pozisyonunda histogram
+ *      uniformluğu — max frekans <8 (256 girişte uniform=1)
+ *   4. Bilinen BF init sabiti reddi: S[0][0]==0xd1310ba6
+ *      olduğunda bu, BF_set_key çalışmamış init tablosu
+ *   5. TAM S-box logu: Python ile doğrulama için 4×1024B
+ *   6. 3 geçiş: 1s / 5s / 10s — oyun sunucusu geç bağlanabilir
+ * ══════════════════════════════════════════════════════ */
+
+#define BF_P_DWORDS   18
+#define BF_S_DWORDS   (4 * 256)
+#define BF_KEY_SIZE   ((BF_P_DWORDS + BF_S_DWORDS) * 4)   /* 4168 byte */
+
+/* Bilinen ilk Blowfish başlangıç sabitleri (BF_set_key çalışmamış tablo) */
+#define BF_INIT_S0_0  0xd1310ba6u
+#define BF_INIT_P0    0x243f6a88u
+
+/* Tarama durumu */
+static volatile LONG g_scan_triggered = 0;
+static volatile LONG g_scan_running   = 0;
+static HANDLE        g_scan_shutdown  = NULL;  /* DLL_PROCESS_DETACH'ta sinyallenir */
+
+/* Forward declaration */
+static void ensure_init(void);
+
+/*
+ * Sıkı S-box testi — 4 byte pozisyonunun her birinde
+ * histogram oluşturur; max frekans < 8 olmalı.
+ * Grafik RGBA bufferlarda alpha=0xFF →256 kez tekrar → elenir.
+ * Ses PCM bufferlarda üst 16 bit=0 →256 kez tekrar → elenir.
+ */
+static BOOL sbox_strict(const uint32_t *sbox) {
+    uint8_t h0[256], h1[256], h2[256], h3[256];
+    memset(h0,0,256); memset(h1,0,256);
+    memset(h2,0,256); memset(h3,0,256);
+
+    for (int i = 0; i < 256; i++) {
+        uint32_t v = sbox[i];
+        h0[(uint8_t)(v >> 24)]++;
+        h1[(uint8_t)(v >> 16)]++;
+        h2[(uint8_t)(v >>  8)]++;
+        h3[(uint8_t)(v      )]++;
+    }
+    for (int b = 0; b < 256; b++) {
+        if (h0[b] > 7 || h1[b] > 7 || h2[b] > 7 || h3[b] > 7)
+            return FALSE;
+    }
+    return TRUE;
+}
+
+static void log_bf_candidate(FILE *f, int num, const void *addr,
+                              const MEMORY_BASIC_INFORMATION *mbi,
+                              const uint32_t *dw) {
+    log_time(f);
+    fprintf(f,
+        "\n╔══════════════════════════════════════════╗\n"
+        "║  BF_KEY ADAYI #%-3d — BELLEK TARAMA v2    ║\n"
+        "╚══════════════════════════════════════════╝\n"
+        "  Adres  : %p\n"
+        "  Bölge  : %p  [%lu KB]  Tür=%lu\n",
+        num, addr,
+        mbi->BaseAddress, (unsigned long)(mbi->RegionSize / 1024),
+        (unsigned long)mbi->Type);
+
+    /* P-array tam hex (72 byte) */
+    log_hex(f, "P-array", (const uint8_t*)dw, BF_P_DWORDS * 4);
+
+    /* TAM S-box'lar (4 × 1024 byte) — Python doğrulama için gerekli */
+    log_hex(f, "S[0] (1024B)", (const uint8_t*)(dw + BF_P_DWORDS),               1024);
+    log_hex(f, "S[1] (1024B)", (const uint8_t*)(dw + BF_P_DWORDS + 256),         1024);
+    log_hex(f, "S[2] (1024B)", (const uint8_t*)(dw + BF_P_DWORDS + 512),         1024);
+    log_hex(f, "S[3] (1024B)", (const uint8_t*)(dw + BF_P_DWORDS + 768),         1024);
+
+    /* Tek satır P-array (Python kopyala/yapıştır için) */
+    fprintf(f, "  [FULL_KEY] P:");
+    for (int i = 0; i < BF_P_DWORDS; i++) fprintf(f, "%08x", dw[i]);
+    fprintf(f, "\n");
+    fflush(f);
+}
+
+/* Tek geçiş — belirli adres aralığını tara */
+static int run_one_pass(FILE *f, int pass_num) {
+    int candidates = 0, pages = 0;
+
+    /* Sadece oyun özel belleği: 1 MB – 1 GB arası */
+    uint8_t *scan_lo = (uint8_t *)0x00100000;
+    uint8_t *scan_hi = (uint8_t *)0x40000000;
+
+    MEMORY_BASIC_INFORMATION mbi;
+    uint8_t *addr = scan_lo;
+
+    while (addr < scan_hi &&
+           VirtualQuery(addr, &mbi, sizeof(mbi)) == sizeof(mbi)) {
+
+        uint8_t *base = (uint8_t *)mbi.BaseAddress;
+        size_t   rsz  = mbi.RegionSize;
+
+        /* Sonraki adres — taşma koruması */
+        uint8_t *next = base + rsz;
+        if (next <= base) break;
+
+        /* Filtre: commit, özel, R/W, Guard değil, boyut uygun */
+        if (mbi.State   == MEM_COMMIT              &&
+            mbi.Type    == MEM_PRIVATE             &&
+            (mbi.Protect & (PAGE_READWRITE |
+                            PAGE_EXECUTE_READWRITE)) &&
+            !(mbi.Protect & PAGE_GUARD)            &&
+            rsz         >= (size_t)BF_KEY_SIZE     &&
+            rsz         <= 16u * 1024u * 1024u) {  /* max 16 MB */
+
+            pages++;
+
+            /* Tampon yeterince büyükse doğrudan oku */
+            static uint8_t tmp[16 * 1024 * 1024];
+            SIZE_T copied = 0;
+            if (!ReadProcessMemory(GetCurrentProcess(),
+                                   base, tmp, rsz, &copied) || copied < BF_KEY_SIZE) {
+                addr = next; continue;
+            }
+
+            for (size_t off = 0; off + BF_KEY_SIZE <= copied; off += 4) {
+                const uint32_t *dw = (const uint32_t *)(tmp + off);
+
+                /* Hızlı ön-eleme */
+                if (dw[0] == 0) continue;
+
+                /* Bilinen init sabitini reddet */
+                if (dw[BF_P_DWORDS] == BF_INIT_S0_0) continue;
+
+                /* Sıkı histogram testi — tüm 4 S-box */
+                if (!sbox_strict(dw + BF_P_DWORDS      )) continue;
+                if (!sbox_strict(dw + BF_P_DWORDS + 256)) continue;
+                if (!sbox_strict(dw + BF_P_DWORDS + 512)) continue;
+                if (!sbox_strict(dw + BF_P_DWORDS + 768)) continue;
+
+                candidates++;
+                log_bf_candidate(f, candidates, base + off, &mbi, dw);
+
+                off += BF_KEY_SIZE - 4;  /* örtüşen eşleşmeleri atla */
+            }
+        }
+        addr = next;
+    }
+
+    log_time(f);
+    fprintf(f, "=== GEÇİŞ %d TAMAM: %d sayfa, %d aday ===\n\n",
+            pass_num, pages, candidates);
+    fflush(f);
+    return candidates;
+}
+
+static DWORD WINAPI scan_thread(LPVOID param) {
+    (void)param;
+
+    /* 3 geçiş: login key (1s) + game server key (5s) + yedek (10s) */
+    static const DWORD delays[] = {1000, 5000, 10000};
+
+    for (int pass = 0; pass < 3; pass++) {
+        Sleep(delays[pass]);
+
+        FILE *f = g_log_crypto;
+        FILE *fb = NULL;
+        if (!f) {
+            char path[MAX_PATH];
+            make_path(path, "pb_key_fallback.log");
+            fb = fopen(path, "a");
+            f = fb;
+        }
+        if (!f) continue;
+
+        log_time(f);
+        fprintf(f, "\n=== BELLEK TARAMASI v2 — GEÇİŞ %d ===\n", pass + 1);
+        fflush(f);
+
+        run_one_pass(f, pass + 1);
+
+        if (fb) { fclose(fb); fb = NULL; }
+    }
+
+    InterlockedExchange(&g_scan_running, 0);
+    return 0;
+}
+
+/* Oyun sunucusuna bağlanınca taramayı bir kere tetikle */
+static void trigger_memscan(void) {
+    if (InterlockedCompareExchange(&g_scan_triggered, 1, 0) == 0) {
+        InterlockedExchange(&g_scan_running, 1);
+        HANDLE t = CreateThread(NULL, 0, scan_thread, NULL, 0, NULL);
+        if (t) CloseHandle(t);
+        else   InterlockedExchange(&g_scan_running, 0);
+    }
+}
+
 /* ── HOOK: connect ── */
 static int WINAPI hook_connect(SOCKET s,
                                 const struct sockaddr *name, int namelen) {
@@ -204,6 +409,16 @@ static int WINAPI hook_connect(SOCKET s,
                 addr, (unsigned long long)s);
         fflush(g_log_net);
     }
+
+    /* Oyun sunucusu portlarında tarama başlat (443/53/80 değil) */
+    if (name && name->sa_family == AF_INET) {
+        uint16_t port = ntohs(((const struct sockaddr_in *)name)->sin_port);
+        if (port != 80 && port != 443 && port != 53 && port > 1024) {
+            ensure_init();
+            trigger_memscan();
+        }
+    }
+
     return ((fn_connect_t)d_connect.orig_fn)(s, name, namelen);
 }
 
@@ -214,7 +429,8 @@ static int WINAPI hook_send(SOCKET s, const char *buf, int len, int flags) {
         char peer[64];
         socket_peer(s, peer, sizeof(peer));
         log_time(g_log_net);
-        fprintf(g_log_net, "TCP SEND → %-22s  ", peer);
+        fprintf(g_log_net, "TCP SEND → %-22s  bf_calls=%ld  ",
+                peer, (long)g_bf_export_calls);
         log_hex(g_log_net, "", (const unsigned char*)buf, ret);
         fflush(g_log_net);
     }
@@ -228,7 +444,8 @@ static int WINAPI hook_recv(SOCKET s, char *buf, int len, int flags) {
         char peer[64];
         socket_peer(s, peer, sizeof(peer));
         log_time(g_log_net);
-        fprintf(g_log_net, "TCP RECV ← %-22s  ", peer);
+        fprintf(g_log_net, "TCP RECV ← %-22s  bf_calls=%ld  ",
+                peer, (long)g_bf_export_calls);
         log_hex(g_log_net, "", (const unsigned char*)buf, ret);
         fflush(g_log_net);
     }
@@ -393,27 +610,45 @@ typedef void (OSSL_CC *fn_BF_cfb64_t)(const unsigned char*, unsigned char*,
 typedef int  (OSSL_CC *fn_RSA_pub_enc_t)(int, const unsigned char*,
                                           unsigned char*, RSA*, int);
 
-/* ── HOOK: BF_set_key — session key ham haliyle burada! ── */
+/* ── HOOK: BF_set_key (inline detour on libcrypto-1_1_orig.dll) ── */
 static void OSSL_CC hook_BF_set_key(BF_KEY *key, int len,
                                      const unsigned char *data) {
-    if (g_log_crypto && data && len > 0) {
-        log_time(g_log_crypto);
-        fprintf(g_log_crypto,
-            "\n!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n"
-            "  BF_set_key — BLOWFISH SESSION KEY\n"
-            "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n");
-        log_hex(g_log_crypto, "SESSION KEY (ham)", data, len);
-        fprintf(g_log_crypto, "  Key uzunlugu: %d byte (%d bit)\n", len, len * 8);
-        /* ASCII okunabilir mi? */
-        int all_print = 1;
-        for (int i = 0; i < len; i++)
-            if (data[i] < 0x20 || data[i] > 0x7e) { all_print = 0; break; }
-        if (all_print) {
-            fprintf(g_log_crypto, "  ASCII: %.*s\n", len, (const char*)data);
+    InterlockedIncrement(&g_bf_export_calls);
+    /* Always output to debugger — file may not be open yet */
+    {
+        char dbg[128];
+        snprintf(dbg, sizeof(dbg),
+                 "[pb_proxy] hook_BF_set_key INLINE called len=%d\n", len);
+        OutputDebugStringA(dbg);
+    }
+    if (data && len > 0) {
+        /* Open a fallback log in case g_log_crypto is NULL */
+        FILE *f = g_log_crypto;
+        FILE *fb = NULL;
+        if (!f) {
+            char fb_path[MAX_PATH];
+            make_path(fb_path, "pb_key_fallback.log");
+            fb = fopen(fb_path, "a");
+            f = fb;
         }
-        fprintf(g_log_crypto,
-            "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n\n");
-        fflush(g_log_crypto);
+        if (f) {
+            log_time(f);
+            fprintf(f,
+                "\n!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n"
+                "  BF_set_key INLINE — BLOWFISH SESSION KEY\n"
+                "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n");
+            log_hex(f, "SESSION KEY (ham)", data, len);
+            fprintf(f, "  Key uzunlugu: %d byte (%d bit)\n", len, len * 8);
+            int all_print = 1;
+            for (int i = 0; i < len; i++)
+                if (data[i] < 0x20 || data[i] > 0x7e) { all_print = 0; break; }
+            if (all_print)
+                fprintf(f, "  ASCII: %.*s\n", len, (const char*)data);
+            fprintf(f,
+                "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n\n");
+            fflush(f);
+            if (fb) fclose(fb);
+        }
     }
     ((fn_BF_set_key_t)d_BF_set_key.orig_fn)(key, len, data);
 }
@@ -561,9 +796,12 @@ static void install_winsock_hooks(void) {
  *  OPENSSL PROXY — fonksiyon pointer'ları
  * ══════════════════════════════════════════════════════ */
 
+typedef void (OSSL_CC *fn_BF_set_key)(BF_KEY*, int, const unsigned char*);
 typedef void (OSSL_CC *fn_BF_cfb64_encrypt)(
     const unsigned char*, unsigned char*, long,
     const BF_KEY*, unsigned char*, int*, int);
+typedef void (OSSL_CC *fn_BF_encrypt)(uint32_t*, const BF_KEY*);
+typedef void (OSSL_CC *fn_BF_decrypt)(uint32_t*, const BF_KEY*);
 typedef int  (OSSL_CC *fn_RSA_public_encrypt)(
     int, const unsigned char*, unsigned char*, RSA*, int);
 typedef int  (OSSL_CC *fn_RSA_size)(const RSA*);
@@ -573,7 +811,10 @@ typedef int  (OSSL_CC *fn_BIO_free)(BIO*);
 typedef void (OSSL_CC *fn_RSA_free)(RSA*);
 typedef void (OSSL_CC *fn_RAND_seed)(const void*, int);
 
+static fn_BF_set_key             real_BF_set_key             = NULL;
 static fn_BF_cfb64_encrypt       real_BF_cfb64_encrypt       = NULL;
+static fn_BF_encrypt             real_BF_encrypt             = NULL;
+static fn_BF_decrypt             real_BF_decrypt             = NULL;
 static fn_RSA_public_encrypt     real_RSA_public_encrypt     = NULL;
 static fn_RSA_size               real_RSA_size               = NULL;
 static fn_PEM_read_bio_RSAPublicKey real_PEM_read_bio_RSAPublicKey = NULL;
@@ -637,7 +878,9 @@ static BOOL CALLBACK do_init(PINIT_ONCE p, PVOID param, PVOID *ctx) {
     }
     if (g_real_crypto) {
 #define LOAD(name) real_##name = (fn_##name)GetProcAddress(g_real_crypto, #name)
-        LOAD(BF_cfb64_encrypt); LOAD(RSA_public_encrypt);
+        LOAD(BF_set_key); LOAD(BF_cfb64_encrypt);
+        LOAD(BF_encrypt); LOAD(BF_decrypt);
+        LOAD(RSA_public_encrypt);
         LOAD(RSA_size); LOAD(PEM_read_bio_RSAPublicKey);
         LOAD(BIO_new_mem_buf); LOAD(BIO_free);
         LOAD(RSA_free); LOAD(RAND_seed);
@@ -669,17 +912,54 @@ static void ensure_init(void) {
  *  OPENSSL EXPORT HOOK'LARI
  * ══════════════════════════════════════════════════════ */
 
+/* ── EXPORT STUB: BF_set_key — game calls this to set the session key ── */
+__declspec(dllexport) void OSSL_CC
+BF_set_key(BF_KEY *key, int len, const unsigned char *data) {
+    ensure_init();
+    InterlockedIncrement(&g_bf_export_calls);
+    /* Always log — use OutputDebugStringA as fallback if file is unavailable */
+    {
+        char dbg[128];
+        snprintf(dbg, sizeof(dbg),
+                 "[pb_proxy] BF_set_key EXPORT called len=%d\n", len);
+        OutputDebugStringA(dbg);
+    }
+    if (g_log_crypto && data && len > 0) {
+        log_time(g_log_crypto);
+        fprintf(g_log_crypto,
+            "\n!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n"
+            "  BF_set_key EXPORT — BLOWFISH SESSION KEY\n"
+            "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n");
+        log_hex(g_log_crypto, "SESSION KEY (ham)", data, len);
+        fprintf(g_log_crypto, "  Key uzunlugu: %d byte (%d bit)\n",
+                len, len * 8);
+        int all_print = 1;
+        for (int i = 0; i < len; i++)
+            if (data[i] < 0x20 || data[i] > 0x7e) { all_print = 0; break; }
+        if (all_print)
+            fprintf(g_log_crypto, "  ASCII: %.*s\n", len, (const char*)data);
+        fprintf(g_log_crypto,
+            "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n\n");
+        fflush(g_log_crypto);
+    }
+    if (real_BF_set_key)
+        real_BF_set_key(key, len, data);
+}
+
 __declspec(dllexport) void OSSL_CC
 BF_cfb64_encrypt(const unsigned char *in, unsigned char *out,
                  long length, const BF_KEY *key,
                  unsigned char *ivec, int *num, int enc) {
     ensure_init();
+    InterlockedIncrement(&g_bf_export_calls);
+    OutputDebugStringA("[pb_proxy] BF_cfb64_encrypt EXPORT called\n");
     if (g_log_crypto) {
         log_time(g_log_crypto);
-        fprintf(g_log_crypto, "BF_cfb64_encrypt — %s, len=%ld\n",
-                enc == 1 ? "ENCRYPT" : "DECRYPT", length);
+        fprintf(g_log_crypto, "BF_cfb64_encrypt EXPORT — %s, len=%ld  [call#%ld]\n",
+                enc == 1 ? "ENCRYPT" : "DECRYPT", length,
+                (long)g_bf_export_calls);
         log_hex(g_log_crypto, "ivec", ivec, 8);
-        log_hex(g_log_crypto, "in (plaintext)", in, (int)length);
+        log_hex(g_log_crypto, "in", in, (int)length);
         log_hex(g_log_crypto, "key P-array[0:32]",
                 (const unsigned char*)key, 32);
         fflush(g_log_crypto);
@@ -688,6 +968,49 @@ BF_cfb64_encrypt(const unsigned char *in, unsigned char *out,
         real_BF_cfb64_encrypt(in, out, length, key, ivec, num, enc);
     if (g_log_crypto && enc == 0) {
         log_hex(g_log_crypto, "out (decrypted)", out, (int)length);
+        fflush(g_log_crypto);
+    }
+}
+
+/* ── EXPORT STUB: BF_encrypt / BF_decrypt (block-level ECB mode) ── */
+__declspec(dllexport) void OSSL_CC
+BF_encrypt(uint32_t *data, const BF_KEY *key) {
+    ensure_init();
+    InterlockedIncrement(&g_bf_export_calls);
+    OutputDebugStringA("[pb_proxy] BF_encrypt EXPORT called\n");
+    if (g_log_crypto) {
+        log_time(g_log_crypto);
+        fprintf(g_log_crypto, "BF_encrypt EXPORT — block  [call#%ld]\n",
+                (long)g_bf_export_calls);
+        log_hex(g_log_crypto, "in block", (const unsigned char*)data, 8);
+        log_hex(g_log_crypto, "key P-array[0:32]",
+                (const unsigned char*)key, 32);
+        fflush(g_log_crypto);
+    }
+    if (real_BF_encrypt) real_BF_encrypt(data, key);
+    if (g_log_crypto) {
+        log_hex(g_log_crypto, "out block", (const unsigned char*)data, 8);
+        fflush(g_log_crypto);
+    }
+}
+
+__declspec(dllexport) void OSSL_CC
+BF_decrypt(uint32_t *data, const BF_KEY *key) {
+    ensure_init();
+    InterlockedIncrement(&g_bf_export_calls);
+    OutputDebugStringA("[pb_proxy] BF_decrypt EXPORT called\n");
+    if (g_log_crypto) {
+        log_time(g_log_crypto);
+        fprintf(g_log_crypto, "BF_decrypt EXPORT — block  [call#%ld]\n",
+                (long)g_bf_export_calls);
+        log_hex(g_log_crypto, "in block", (const unsigned char*)data, 8);
+        log_hex(g_log_crypto, "key P-array[0:32]",
+                (const unsigned char*)key, 32);
+        fflush(g_log_crypto);
+    }
+    if (real_BF_decrypt) real_BF_decrypt(data, key);
+    if (g_log_crypto) {
+        log_hex(g_log_crypto, "out block", (const unsigned char*)data, 8);
         fflush(g_log_crypto);
     }
 }

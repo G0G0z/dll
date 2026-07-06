@@ -1,0 +1,1 @@
+Replit ortamında dll bluid i zig ile yap.
