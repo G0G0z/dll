@@ -1,0 +1,10 @@
+LIBRARY libcrypto-1_1
+EXPORTS
+    BF_cfb64_encrypt
+    RSA_public_encrypt
+    RSA_size
+    PEM_read_bio_RSAPublicKey
+    BIO_new_mem_buf
+    BIO_free
+    RSA_free
+    RAND_seed
