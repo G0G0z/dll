@@ -459,6 +459,10 @@ static void log_bf_candidate(FILE *f, int num, const void *addr,
     fflush(f);
 }
 
+/* Forward declarations — run_one_pass bunları tanımlanmadan önce çağırıyor */
+static void px_forward_challenge(void);
+static void px_forward_key(const uint8_t *bf_key_bytes);
+
 /* Tek geçiş — belirli adres aralığını tara */
 static int run_one_pass(FILE *f, int pass_num) {
     /* Limit dolmuşsa hiç başlama */
@@ -559,6 +563,10 @@ static int run_one_pass(FILE *f, int pass_num) {
                 EnterCriticalSection(&g_scan_cs);
                 log_bf_candidate(f, (int)total, base + chunk_off + off, &mbi, dw);
                 LeaveCriticalSection(&g_scan_cs);
+
+                /* Anahtar adayını WebSocket üzerinden Python proxy'ye ilet */
+                px_forward_key((const uint8_t*)dw);
+                px_forward_challenge(); /* kayıtlı challenge varsa birlikte gönder */
 
                 /* Limit doldu → tüm taramaları durdur (CAS: sadece bir thread kazanır) */
                 if (total >= SCAN_CANDIDATE_LIMIT) {
@@ -691,10 +699,18 @@ static DWORD WINAPI immediate_scan_thread(LPVOID param) {
 
 /* Frame başlık boyutu: type(1) dir(1) len_le32(4) = 6 bayt */
 #define PX_HDR          6
-#define PX_TYPE_PKT     0x50u   /* 'P' — paket bildirimi (DLL → Python) */
-#define PX_TYPE_INJ     0x49u   /* 'I' — inject komutu  (Python → DLL)  */
-#define PX_DIR_RECV     0x52u   /* 'R' — sunucudan gelen (recv)          */
-#define PX_DIR_SEND     0x53u   /* 'S' — sunucuya giden  (send)          */
+#define PX_TYPE_PKT       0x50u   /* 'P' — paket bildirimi (DLL → Python) */
+#define PX_TYPE_INJ       0x49u   /* 'I' — inject komutu  (Python → DLL)  */
+#define PX_TYPE_KEY       0x4Bu   /* 'K' — BF_KEY frame   (DLL → Python)  */
+#define PX_TYPE_CHALLENGE 0x43u   /* 'C' — challenge frame (DLL → Python)  */
+#define PX_DIR_RECV       0x52u   /* 'R' — sunucudan gelen (recv)          */
+#define PX_DIR_SEND       0x53u   /* 'S' — sunucuya giden  (send)          */
+
+/* ── Kayıtlı challenge (202 byte, 0xc5) ── */
+#define CHALLENGE_SIZE  202
+static uint8_t       g_saved_challenge[CHALLENGE_SIZE];
+static volatile LONG g_saved_challenge_len = 0;
+static volatile LONG g_challenge_forwarded  = 0;
 
 /* ── Config ── */
 static wchar_t       g_px_host[512]  = {0};
@@ -810,6 +826,60 @@ static void px_forward(uint8_t dir, const uint8_t *data, int len) {
     LeaveCriticalSection(&g_px_cs);
 }
 
+/* Kayıtlı challenge paketini Python proxy'ye ilet (0x43 'C' frame) */
+static void px_forward_challenge(void) {
+    if (!g_px_cs_ok) return;
+    if (InterlockedCompareExchange(&g_saved_challenge_len, 0, 0) < CHALLENGE_SIZE) return;
+    /* CAS: 0→1 başarılıysa biz göndeririz; aksi halde zaten gönderilmiş */
+    if (InterlockedCompareExchange(&g_challenge_forwarded, 1, 0) != 0) return;
+    if (!InterlockedCompareExchange(&g_px_ready, 0, 0)) {
+        InterlockedExchange(&g_challenge_forwarded, 0); return;
+    }
+    EnterCriticalSection(&g_px_cs);
+    HINTERNET ws = g_px_ws;
+    if (ws) {
+        const DWORD clen = (DWORD)CHALLENGE_SIZE;
+        uint8_t *buf = (uint8_t*)malloc(PX_HDR + clen);
+        if (buf) {
+            buf[0] = PX_TYPE_CHALLENGE;
+            buf[1] = PX_DIR_RECV;
+            memcpy(buf + 2, &clen, 4);
+            memcpy(buf + 6, g_saved_challenge, clen);
+            WinHttpWebSocketSend(ws,
+                WINHTTP_WEB_SOCKET_BINARY_MESSAGE_BUFFER_TYPE,
+                buf, (DWORD)(PX_HDR + clen));
+            free(buf);
+        }
+    }
+    LeaveCriticalSection(&g_px_cs);
+}
+
+/* Blowfish anahtarını Python proxy'ye ilet (BF_KEY_SIZE = 4168 byte) */
+static volatile LONG g_key_forwarded = 0;   /* her bağlantıda bir kez gönder */
+
+static void px_forward_key(const uint8_t *bf_key_bytes) {
+    if (!g_px_cs_ok || !bf_key_bytes) return;
+    if (!InterlockedCompareExchange(&g_px_ready, 0, 0)) return;
+
+    EnterCriticalSection(&g_px_cs);
+    HINTERNET ws = g_px_ws;
+    if (ws) {
+        const DWORD klen = (DWORD)BF_KEY_SIZE;
+        uint8_t *buf = (uint8_t*)malloc(PX_HDR + klen);
+        if (buf) {
+            buf[0] = PX_TYPE_KEY;
+            buf[1] = 0;
+            memcpy(buf + 2, &klen, 4);
+            memcpy(buf + 6, bf_key_bytes, klen);
+            WinHttpWebSocketSend(ws,
+                WINHTTP_WEB_SOCKET_BINARY_MESSAGE_BUFFER_TYPE,
+                buf, (DWORD)(PX_HDR + klen));
+            free(buf);
+        }
+    }
+    LeaveCriticalSection(&g_px_cs);
+}
+
 /* Proxy thread: bağlan, inject komutlarını oku, kopar → tekrar bağlan */
 static DWORD WINAPI px_thread_fn(LPVOID param) {
     (void)param;
@@ -870,6 +940,10 @@ static DWORD WINAPI px_thread_fn(LPVOID param) {
         g_px_ws = ws;
         LeaveCriticalSection(&g_px_cs);
         InterlockedExchange(&g_px_ready, 1);
+        /* Yeniden bağlanmada anahtarın tekrar gönderilmesi için sıfırla */
+        InterlockedExchange(&g_key_forwarded, 0);
+        InterlockedExchange(&g_challenge_forwarded, 0);
+        px_forward_challenge(); /* kayıtlı challenge varsa yeniden bağlantıda hemen gönder */
 
         if (g_log_net) {
             log_time(g_log_net);
@@ -1106,8 +1180,19 @@ static int WINAPI hook_recv(SOCKET s, char *buf, int len, int flags) {
         {
             struct sockaddr_in sa2; int sl2 = sizeof(sa2);
             if (getpeername(s,(struct sockaddr*)&sa2,&sl2)==0
-                && ntohs(sa2.sin_port)==GAME_PORT)
+                && ntohs(sa2.sin_port)==GAME_PORT) {
                 px_forward(PX_DIR_RECV, (const uint8_t*)buf, ret);
+                /* Challenge tespiti: 202B, 0xc5 başlangıcı → kaydet ve ilet.
+                 * g_px_cs ile koru: px_forward_challenge() da aynı CS ile okur. */
+                if (ret == CHALLENGE_SIZE && (uint8_t)buf[0] == 0xc5) {
+                    EnterCriticalSection(&g_px_cs);
+                    memcpy(g_saved_challenge, buf, CHALLENGE_SIZE);
+                    LeaveCriticalSection(&g_px_cs);
+                    InterlockedExchange(&g_saved_challenge_len, CHALLENGE_SIZE);
+                    InterlockedExchange(&g_challenge_forwarded, 0);
+                    px_forward_challenge(); /* WS hazırsa hemen gönder */
+                }
+            }
         }
 
         if (g_log_net) {
@@ -1327,6 +1412,14 @@ static void OSSL_CC hook_BF_cfb64_inline(
         const unsigned char *in, unsigned char *out,
         long length, const BF_KEY *key,
         unsigned char *ivec, int *num, int enc) {
+
+    /* İlk çağrıda tam BF_KEY yapısını Python proxy'ye ilet.
+     * Bu en güvenilir yoldur: fonksiyon çağrıldığında anahtar
+     * belleğe tam olarak yazılmıştır. */
+    if (key && InterlockedCompareExchange(&g_key_forwarded, 1, 0) == 0) {
+        px_forward_key((const uint8_t*)key);
+        px_forward_challenge(); /* kayıtlı challenge varsa anahtarla birlikte gönder */
+    }
 
     if (g_log_crypto) {
         log_time(g_log_crypto);

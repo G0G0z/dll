@@ -105,6 +105,30 @@ class Session:
             return True
         return False
 
+    def score_iv(self, candidate_iv: bytes, n_pkts: int = 8) -> int:
+        """IV adayının mevcut paketlere göre skor hesapla (proto=0x0D eşleşmesi)."""
+        if not self.P:
+            return 0
+        test = [ev for ev in self.packets[-30:]
+                if ev.get('size', 0) < 64 and ev.get('raw_hex') and ev.get('status') != 'challenge'][:n_pkts]
+        score = 0
+        for ev in test:
+            raw = bytes.fromhex(ev['raw_hex'])
+            p = cfb64_dec(self.P, self.S, raw, candidate_iv)
+            if p and len(p) > 1 and p[1] == 0x0D:
+                score += 1
+        return score
+
+    def apply_iv_if_better(self, candidate_iv: bytes) -> bool:
+        """Mevcut IV'den daha iyi ya da eşit skor veriyorsa uygula."""
+        new_score = self.score_iv(candidate_iv)
+        old_score = self.score_iv(self.iv) if self.iv else -1
+        if new_score >= old_score:
+            self.iv = candidate_iv
+            return True
+        print(f'[IV] Reddedildi {candidate_iv.hex()} (skor {new_score}) < mevcut {self.iv.hex()} (skor {old_score})')
+        return False
+
     def decrypt(self, cipher):
         if not self.has_key() or not self.has_iv(): return None
         return cfb64_dec(self.P, self.S, cipher, self.iv)
@@ -185,16 +209,93 @@ async def dll_handler(request):
 
     return ws
 
+# BF_KEY boyutu: P-array (18 × 4B) + S-box'lar (4 × 256 × 4B) = 4168 byte
+BF_KEY_SIZE = (18 + 4 * 256) * 4
+
+async def _handle_key_frame(raw: bytes):
+    """DLL'den gelen KEY frame (0x4B): BF_KEY otomatik yükle."""
+    if len(raw) < BF_KEY_SIZE:
+        return
+    P = list(struct.unpack_from('<18I', raw, 0))
+    S = [list(struct.unpack_from('<256I', raw, (18 + i * 256) * 4)) for i in range(4)]
+    session.P, session.S = P, S
+    sig = (S[0][0], S[1][0], S[2][0], S[3][0])
+    confirmed = '✓ ONAYLANDI' if sig == CONFIRMED_SIG else '(doğrulanmadı)'
+    sig_str   = ' '.join(f'{x:08x}' for x in sig)
+    msg = f'Anahtar DLL\'den otomatik yüklendi {confirmed} — SIG={sig_str}'
+    print(f'[KEY] {msg}')
+    await broadcast({'type': 'key_loaded', 'iv': session.iv.hex() if session.iv else None})
+    await broadcast({'type': 'status', 'msg': msg, 'level': 'ok'})
+    await _redecrypt_session()  # önceden encrypted gelen paketleri yeniden çöz
+
+async def _redecrypt_session():
+    """Anahtar + IV mevcut olduğunda 'encrypted' paketleri retroaktif çöz."""
+    if not session.has_key() or not session.has_iv():
+        return
+    changed = 0
+    for ev in session.packets:
+        if ev.get('status') != 'encrypted':
+            continue
+        raw = bytes.fromhex(ev.get('raw_hex', ''))
+        if not raw:
+            continue
+        plain = cfb64_dec(session.P, session.S, raw, session.iv)
+        if plain is None:
+            continue
+        ev['plain_hex']   = plain.hex()
+        ev['len_field']   = plain[0] if plain else None
+        ev['proto']       = plain[1] if len(plain) > 1 else None
+        ev['opcode']      = plain[2] if len(plain) > 2 else None
+        ev['payload_hex'] = plain[3:67].hex() if len(plain) > 3 else ''
+        expected  = (ev['size'] - 3) & 0xFF
+        len_ok    = (ev['len_field'] == expected and ev['size'] <= 258)
+        proto_ok  = (ev['proto'] == 0x0D)
+        if len_ok and proto_ok:        ev['status'] = 'ok'
+        elif proto_ok and not len_ok:  ev['status'] = 'large'
+        elif len_ok and not proto_ok:  ev['status'] = 'proto?'
+        else:                          ev['status'] = 'mismatch'
+        if ev['opcode'] is not None:   ev['opcode'] = f"0x{ev['opcode']:02x}"
+        if ev['proto']  is not None:   ev['proto']  = f"0x{ev['proto']:02x}"
+        ev['note'] = 'retroaktif çözüldü'
+        changed += 1
+    if changed:
+        print(f'[REDECRYPT] {changed} paket güncellendi')
+        await broadcast({'type': 'redecrypted', 'packets': session.packets[-500:]})
+        await broadcast({'type': 'status',
+                         'msg':   f'✓ Retroaktif çözüm: {changed} paket şifre açıldı',
+                         'level': 'ok'})
+
 async def on_dll_frame(data: bytes):
     """DLL'den gelen binary frame: [1B type][1B dir][4B len LE][...data...]"""
     if len(data) < 6:
         return
-    pkt_type  = data[0]      # 'P' = 0x50
+    pkt_type  = data[0]      # 'P'=0x50 'K'=0x4B 'C'=0x43
     direction = chr(data[1]) # 'R' or 'S'
     data_len  = struct.unpack_from('<I', data, 2)[0]
 
     if data_len > len(data) - 6:
         return
+
+    # KEY frame: DLL bellek taramasında anahtar bulunca otomatik gönderir
+    if pkt_type == 0x4B:
+        await _handle_key_frame(data[6: 6 + data_len])
+        return
+
+    # CHALLENGE frame: DLL kayıtlı challenge'ı bağlantıda otomatik gönderir
+    # Her yeni session'da IV güncellenmeli → has_iv() kontrolü yok
+    if pkt_type == 0x43:
+        raw = data[6: 6 + data_len]
+        if len(raw) >= 11 and raw[0] == 0xc5:
+            session.try_challenge(raw)
+            lvl = 'ok' if session.has_key() else 'warn'
+            msg = (f'Challenge (DLL geçmişi) — IV={session.iv.hex()}' if session.has_key()
+                   else f'Challenge (DLL geçmişi) — IV={session.iv.hex()} — anahtar bekleniyor')
+            print(f'[CHG] {msg}')
+            await broadcast({'type': 'key_loaded', 'iv': session.iv.hex()})
+            await broadcast({'type': 'status', 'msg': msg, 'level': lvl})
+            await _redecrypt_session()
+        return
+
     raw = data[6: 6 + data_len]
     ts  = time.strftime('%H:%M:%S')
 
@@ -210,6 +311,7 @@ async def on_dll_frame(data: bytes):
         msg = (f'Challenge alındı — IV={session.iv.hex()}' if session.has_key()
                else 'Challenge alındı — anahtar YOK, decrypt yapılamıyor!')
         await broadcast({'type': 'status', 'msg': msg, 'level': lvl})
+        await _redecrypt_session()  # anahtar varsa mevcut encrypted paketleri çöz
         return
 
     plain = session.decrypt(raw)
@@ -407,6 +509,7 @@ tbody tr.sel td{background:#1c2333!important}
 .s-ok{color:var(--green)}.s-large{color:#7ee787}
 .s-challenge{color:var(--yellow);font-weight:700}
 .s-proto{color:#7dcfff}.s-mismatch{color:var(--gray)}.s-encrypted{color:#3a3f4a}
+.s-truncated{color:#555e6a}
 
 /* Right panel */
 #right{width:350px;display:flex;flex-direction:column;border-left:1px solid var(--border);overflow:hidden;flex-shrink:0}
@@ -481,6 +584,7 @@ tbody tr.sel td{background:#1c2333!important}
       <label>Opcode</label>
       <input id="f-op" type="text" placeholder="0x.." style="width:68px">
       <button id="btn-scroll" class="on" title="Otomatik kaydır">↓ Auto</button>
+      <button id="btn-replay">📂 Log Oynat</button>
       <button id="btn-clear">Temizle</button>
     </div>
     <div id="tbl-wrap">
@@ -551,7 +655,14 @@ function handle(m) {
   }
   else if (m.type === 'dll_connected') { setDll(true, m.peer); }
   else if (m.type === 'dll_disconnected') { setDll(false); }
+  else if (m.type === 'key_loaded') { setKey(true, m.iv); }
   else if (m.type === 'status') { showStatus(m.msg, m.level); }
+  else if (m.type === 'redecrypted') {
+    // Retroaktif çözüm: tüm paket listesini güncelle ve tabloyu yenile
+    packets = m.packets || [];
+    renderAll();
+    updCnt();
+  }
   else if (m.type === 'cleared') {
     packets = []; document.getElementById('tbody').innerHTML = '';
     document.getElementById('detail').innerHTML = '<p style="color:var(--gray);font-size:11px;margin-top:8px">Bir satıra tıklayın…</p>';
@@ -663,6 +774,16 @@ document.getElementById('btn-scroll').addEventListener('click', () => {
 document.getElementById('btn-clear').addEventListener('click', () =>
   ws && ws.send(JSON.stringify({type:'clear'})));
 
+document.getElementById('btn-replay').addEventListener('click', () => {
+  const btn = document.getElementById('btn-replay');
+  btn.disabled = true; btn.textContent = '⏳ Yükleniyor…';
+  fetch('/api/replay').then(r => r.json()).then(d => {
+    btn.disabled = false; btn.textContent = '📂 Log Oynat';
+    if (d.error) showStatus('Log hatası: ' + d.error, 'error');
+    else showStatus(`✓ Log yüklendi: ${d.count} paket  IV=${d.iv||'—'}  (${d.path.split('/').pop()})`, 'ok');
+  }).catch(e => { btn.disabled=false; btn.textContent='📂 Log Oynat'; showStatus('Log yüklenemedi: '+e,'error'); });
+});
+
 // ── Detail ───────────────────────────────────────────────────────────────────
 function selectPkt(seq) {
   selSeq = seq;
@@ -753,12 +874,113 @@ function doInject() {
 </body>
 </html>"""
 
+# ─── Log replay ──────────────────────────────────────────────────────────────
+
+_NET_LINE = re.compile(
+    r'\[(\d{2}:\d{2}:\d{2})'       # timestamp HH:MM:SS
+    r'[^\]]*\]\s+TCP\s+'
+    r'(RECV|SEND)\s+[←→]\s+'
+    r'(\S+)\s+'                     # IP:port
+    r'bf_calls=\d+\s+'
+    r'\[(\d+) bytes\]:\s+'
+    r'([0-9a-fA-F]+)'               # hex (may be truncated)
+)
+_GAME_PORT = '39190'
+
+def parse_netlog(path: str):
+    """pb_net.log'dan port 39190 paketlerini çıkar (hex truncated olabilir)."""
+    pkts = []
+    try:
+        with open(path, encoding='utf-8', errors='replace') as f:
+            for line in f:
+                m = _NET_LINE.search(line)
+                if not m:
+                    continue
+                ts, direction, peer, size_str, hex_data = m.groups()
+                if not peer.endswith(f':{_GAME_PORT}'):
+                    continue
+                size = int(size_str)
+                raw  = bytes.fromhex(hex_data)
+                pkts.append({
+                    'ts':   ts,
+                    'dir':  'R' if direction == 'RECV' else 'S',
+                    'size': size,
+                    'raw':  raw,                  # first ≤128 bytes
+                    'full': len(raw) >= size,     # no truncation?
+                })
+    except OSError:
+        pass
+    return pkts
+
+async def replay_handler(request):
+    """GET /api/replay — attached_assets/pb_net_*.log'dan paketleri yükle ve şifrele."""
+    files = sorted(glob.glob('attached_assets/pb_net_*.log'), reverse=True)
+    if not files:
+        return web.json_response({'error': 'pb_net log bulunamadı'}, status=404)
+
+    path  = files[0]
+    pkts  = parse_netlog(path)
+    if not pkts:
+        return web.json_response({'error': 'Log boş veya ayrıştırılamadı'}, status=422)
+
+    # Sıfırla
+    session.packets.clear()
+    session.seq = 0
+    replay_iv = session.iv  # mevcut IV varsa kullan
+
+    evs = []
+    for p in pkts:
+        raw, direction, ts, size = p['raw'], p['dir'], p['ts'], p['size']
+
+        # Challenge tespiti
+        if direction == 'R' and size == 202 and len(raw) >= 11 and raw[0] == 0xc5:
+            replay_iv   = bytes(raw[3:11])
+            session.iv  = replay_iv
+            ev = fmt_packet(session.seq, 'R', raw, None, ts)
+            ev['status'] = 'challenge'
+            ev['note']   = f'IV={replay_iv.hex()} (log)'
+        else:
+            plain = None
+            if session.P and session.S and replay_iv and p['full']:
+                plain = cfb64_dec(session.P, session.S, raw, replay_iv)
+            ev = fmt_packet(session.seq, direction, raw, plain, ts)
+            if not p['full'] and ev['status'] not in ('ok', 'large', 'challenge'):
+                ev['status'] = 'truncated'
+                ev['note']   = f'log kısaltılmış ({len(raw)}/{size}B)'
+        session.seq += 1
+        _store(ev)
+        evs.append(ev)
+
+    # Tüm istemcilere gönder
+    await broadcast({'type': 'cleared'})
+    await asyncio.sleep(0.02)
+    for ev in evs:
+        await broadcast({'type': 'packet', 'pkt': ev})
+
+    return web.json_response({'ok': True, 'count': len(evs), 'path': path,
+                              'iv': replay_iv.hex() if replay_iv else None})
+
 # ─── App ─────────────────────────────────────────────────────────────────────
+
+async def packets_handler(request):
+    """GET /api/packets — ham paket listesi (analiz için)."""
+    pkts = []
+    for ev in session.packets[-200:]:
+        pkts.append({
+            'seq': ev['seq'], 'ts': ev['ts'], 'dir': ev['dir'],
+            'size': ev['size'], 'status': ev['status'],
+            'cipher_hex': ev.get('raw_hex', ''),
+            'opcode': ev.get('opcode'), 'proto': ev.get('proto'),
+            'len_field': ev.get('len_field'),
+        })
+    return web.json_response({'iv': session.iv.hex() if session.iv else None, 'packets': pkts})
 
 def make_app():
     app = web.Application()
-    app.router.add_get('/',             index_handler)
-    app.router.add_get('/api/status',  status_handler)
+    app.router.add_get('/',              index_handler)
+    app.router.add_get('/api/status',   status_handler)
+    app.router.add_get('/api/packets',  packets_handler)
+    app.router.add_get('/api/replay',   replay_handler)
     app.router.add_get('/dll',         dll_handler)
     app.router.add_get('/ui',          ui_handler)
     app.router.add_get('/favicon.ico', lambda r: web.Response(status=204))
