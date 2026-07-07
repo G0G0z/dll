@@ -41,8 +41,9 @@ typedef void BF_KEY;
 typedef void RSA;
 typedef void BIO;
 
-static FILE *g_log_crypto = NULL;   /* pb_crypto.log */
-static FILE *g_log_net    = NULL;   /* pb_net.log    */
+static FILE *g_log_crypto = NULL;   /* pb_crypto.log  — BF key tarama + OpenSSL çağrıları */
+static FILE *g_log_net    = NULL;   /* pb_net.log     — ham şifreli trafik               */
+static FILE *g_log_plain  = NULL;   /* pb_plain.log   — çözülmüş plaintext paketler      */
 
 /* Diagnostic: counts every BF export call — visible in pb_net.log lines */
 static volatile LONG g_bf_export_calls = 0;
@@ -80,6 +81,112 @@ static void log_hex_full(FILE *f, const char *label,
     fprintf(f, "  %-30s [%d bytes]: ", label, len);
     for (int i = 0; i < len; i++) fprintf(f, "%02x", buf[i]);
     fprintf(f, "\n");
+}
+
+/* Forward declaration — log_time aşağıda tanımlı */
+static void log_time(FILE *f);
+
+/* ══════════════════════════════════════════════════════
+ *  PLAINTEXT PAKET LOGGER — pb_plain.log
+ *
+ *  PointBlank protokol çerçeve formatı (onaylı):
+ *    [1B payload_len] [1B proto=0x0D] [1B opcode] [payload_len byte]
+ *  total_pkt_bytes = payload_len + 3
+ *
+ *  BF_cfb64_encrypt çağrılarından doğrudan plaintext alır:
+ *    enc=1 (ENCRYPT) → 'in'  tamponu = gönderilecek plaintext
+ *    enc=0 (DECRYPT) → 'out' tamponu = çözülmüş plaintext
+ *
+ *  Büyük paketler (>256B) tek çağrıda gelebileceği gibi
+ *  birden fazla BF_cfb64_encrypt çağrısıyla da gelebilir;
+ *  her çağrı log satırı olarak bağımsız kaydedilir.
+ * ══════════════════════════════════════════════════════ */
+
+/* Çağrı sayacı — plaintext log başlığında sıra numarası */
+static volatile LONG g_plain_call_seq = 0;
+
+static void log_pb_plain_pkt(FILE *f,
+                              const char          *dir,   /* "SEND →" / "RECV ←" */
+                              const unsigned char *data,
+                              int                  len,
+                              int                  seq) {
+    if (!f || !data || len < 1) return;
+    log_time(f);
+
+    if (len >= 3) {
+        uint8_t  plen   = data[0];          /* payload_len alanı              */
+        uint8_t  proto  = data[1];          /* 0x0D sabit proto byte'ı        */
+        uint8_t  opcode = data[2];          /* işlev kodu                     */
+        int      paysz  = len - 3;          /* gerçek payload boyutu          */
+
+        fprintf(f, "#%-4d %s  total=%-5dB  len_field=%-3u  proto=0x%02x  "
+                   "op=0x%02x(%-3u)  payload(%d)=",
+                seq, dir, len, plen, proto, opcode, opcode, paysz);
+
+        /* İlk 64 bayt payload hex */
+        int show = paysz < 64 ? paysz : 64;
+        for (int i = 0; i < show; i++) fprintf(f, "%02x", data[3 + i]);
+        if (paysz > 64) fprintf(f, "…(+%d)", paysz - 64);
+
+        /* Protokol uyarıları */
+        if (proto != 0x0D)
+            fprintf(f, "  [!proto≠0x0D — büyük/çok-parçalı paket?]");
+        if (plen != (uint8_t)(len - 3) && len <= 258)
+            fprintf(f, "  [!len_field=%u beklenen=%d]", plen, len - 3);
+    } else {
+        /* <3 byte — raw dump */
+        fprintf(f, "#%-4d %s  total=%dB  raw=", seq, dir, len);
+        for (int i = 0; i < len; i++) fprintf(f, "%02x", data[i]);
+    }
+
+    fprintf(f, "\n");
+    fflush(f);
+}
+
+/* Çok-satırlı hex dump (isteğe bağlı ayrıntılı mod için) */
+static void log_pb_hexdump(FILE *f, const unsigned char *data, int len) {
+    if (!f || !data || len <= 0) return;
+    int rows = (len + 15) / 16;
+    for (int r = 0; r < rows && r < 16; r++) {   /* en fazla 16 satır */
+        int base = r * 16;
+        fprintf(f, "    %04x: ", base);
+        for (int i = 0; i < 16; i++) {
+            if (base + i < len) fprintf(f, "%02x ", data[base + i]);
+            else                fprintf(f, "   ");
+        }
+        fprintf(f, " ");
+        for (int i = 0; i < 16 && base + i < len; i++) {
+            uint8_t c = data[base + i];
+            fprintf(f, "%c", (c >= 0x20 && c < 0x7F) ? (char)c : '.');
+        }
+        fprintf(f, "\n");
+    }
+    if (rows > 16) fprintf(f, "    … (%d satır daha)\n", rows - 16);
+    fflush(f);
+}
+
+/*
+ * IV çift-endian logu
+ *
+ * OpenSSL BF_cfb64_encrypt, IV tamponuna l2n() makrosu ile yazar:
+ *   l2n(xl, iv)  →  iv[0..3] = xl >> 24..0   (big-endian)
+ * Oyunun kendi Blowfish'i  union { BF_LONG ul[2]; unsigned char uc[8]; }
+ * kullanıyorsa bellekte little-endian saklıyor demektir.
+ * Her iki yorumu da logla; Python'da hangisinin doğru olduğunu test ederiz.
+ */
+static void log_ivec_endian(FILE *f, const unsigned char *ivec) {
+    if (!f || !ivec) return;
+    /* Big-endian (OpenSSL l2n uyumlu okuma) */
+    uint32_t be0 = ((uint32_t)ivec[0] << 24) | ((uint32_t)ivec[1] << 16) |
+                   ((uint32_t)ivec[2] <<  8) |  (uint32_t)ivec[3];
+    uint32_t be1 = ((uint32_t)ivec[4] << 24) | ((uint32_t)ivec[5] << 16) |
+                   ((uint32_t)ivec[6] <<  8) |  (uint32_t)ivec[7];
+    /* Little-endian (game union { BF_LONG ul[2]; uc[8]; } uyumlu okuma) */
+    uint32_t le0, le1;
+    memcpy(&le0, ivec,     4);
+    memcpy(&le1, ivec + 4, 4);
+    fprintf(f, "  ivec[BE] %08x %08x   ivec[LE] %08x %08x\n",
+            be0, be1, le0, le1);
 }
 
 static void log_time(FILE *f) {
@@ -254,6 +361,36 @@ static BOOL             g_scan_cs_init = FALSE;
 #define GAME_PORT 39190u
 static volatile LONG g_game_socket_seen = 0;  /* game server recv görüldü mü */
 
+/*
+ * Tarama erken durdurma:
+ *   g_total_candidates  — tüm geçişlerde bulunan toplam aday sayısı
+ *   g_memscan_done      — 1 olunca artık hiçbir tarama başlatılmaz,
+ *                         devam eden geçişler de çıkar.
+ *   SCAN_CANDIDATE_LIMIT — bu kadar adaydan sonra tarama tamamen durur.
+ *
+ * Neden 100? İlk geçiş gerçek session key'i bulur; sonraki binlerce
+ * yanlış pozitif sadece log boyutunu şişirir ve oyunu kastırır.
+ */
+#define SCAN_CANDIDATE_LIMIT  100
+static volatile LONG g_total_candidates = 0;
+static volatile LONG g_memscan_done     = 0;
+
+/*
+ * Tarama bitti mi? — interlocked okuma (x86'da aligned 32-bit okuma
+ * zaten atomik, ama tutarlılık için her okumada CAS kullanıyoruz).
+ */
+static BOOL memscan_is_done(void) {
+    return InterlockedCompareExchange(&g_memscan_done, 0, 0) != 0;
+}
+
+/*
+ * Taramayı durdur — yalnızca ilk çağrı etkili (CAS ile set-once).
+ * Dönüş: TRUE → bu çağrı bayrağı set etti (kazanan thread).
+ */
+static BOOL memscan_set_done(void) {
+    return InterlockedCompareExchange(&g_memscan_done, 1, 0) == 0;
+}
+
 /* Forward declaration */
 static void ensure_init(void);
 
@@ -322,6 +459,13 @@ static void log_bf_candidate(FILE *f, int num, const void *addr,
 
 /* Tek geçiş — belirli adres aralığını tara */
 static int run_one_pass(FILE *f, int pass_num) {
+    /* Limit dolmuşsa hiç başlama */
+    if (memscan_is_done()) {
+        fprintf(f, "=== GEÇİŞ %d ATLANDI: tarama limiti doldu ===\n\n", pass_num);
+        fflush(f);
+        return 0;
+    }
+
     int candidates = 0, pages = 0;
 
     /* Tüm kullanıcı alanı: 1 MB – 2 GB (VMP image bölgelerini de kapsar) */
@@ -357,9 +501,12 @@ static int run_one_pass(FILE *f, int pass_num) {
 
         if (mbi.State   == MEM_COMMIT                          &&
             (is_private || is_image)                           &&
-            (mbi.Protect & (PAGE_READWRITE |
-                            PAGE_EXECUTE_READWRITE |
-                            PAGE_EXECUTE_READ))                &&
+            (mbi.Protect & (PAGE_READONLY            |
+                            PAGE_READWRITE           |
+                            PAGE_WRITECOPY           |
+                            PAGE_EXECUTE_READ        |
+                            PAGE_EXECUTE_READWRITE   |
+                            PAGE_EXECUTE_WRITECOPY)) &&
             !(mbi.Protect & PAGE_GUARD)                        &&
             rsz         >= (size_t)BF_KEY_SIZE                 &&
             rsz         <= max_rsz) {
@@ -404,22 +551,46 @@ static int run_one_pass(FILE *f, int pass_num) {
                 if (!sbox_strict(dw + BF_P_DWORDS + 768)) continue;
 
                 candidates++;
+                LONG total = InterlockedIncrement(&g_total_candidates);
+
                 /* g_scan_cs ile atomik log yazımı — çoklu thread log karışmasını önler */
                 EnterCriticalSection(&g_scan_cs);
-                log_bf_candidate(f, candidates, base + chunk_off + off, &mbi, dw);
+                log_bf_candidate(f, (int)total, base + chunk_off + off, &mbi, dw);
                 LeaveCriticalSection(&g_scan_cs);
 
+                /* Limit doldu → tüm taramaları durdur (CAS: sadece bir thread kazanır) */
+                if (total >= SCAN_CANDIDATE_LIMIT) {
+                    memscan_set_done();
+                    log_time(f);
+                    fprintf(f,
+                        "=== TARAMA LİMİTİ DOLDU (%d aday) — artık tarama yapılmayacak ===\n\n",
+                        SCAN_CANDIDATE_LIMIT);
+                    fflush(f);
+                    VirtualFree(tmp, 0, MEM_RELEASE);
+                    return candidates;
+                }
+
                 off += BF_KEY_SIZE - 4;  /* örtüşen eşleşmeleri atla */
+            }
+
+            /* Chunk sonunda da limit kontrolü */
+            if (memscan_is_done()) {
+                VirtualFree(tmp, 0, MEM_RELEASE);
+                goto pass_done;
             }
         }
             VirtualFree(tmp, 0, MEM_RELEASE);
         }  /* if (mbi.State == MEM_COMMIT ...) */
+
+        /* Bölge sonunda limit kontrolü — büyük bölgeleri de erkenden bırak */
+        if (memscan_is_done()) break;
         addr = next;
     }
 
+pass_done:
     log_time(f);
-    fprintf(f, "=== GEÇİŞ %d TAMAM: %d sayfa, %d aday ===\n\n",
-            pass_num, pages, candidates);
+    fprintf(f, "=== GEÇİŞ %d TAMAM: %d sayfa, %d aday (toplam=%ld) ===\n\n",
+            pass_num, pages, candidates, (long)g_total_candidates);
     fflush(f);
     return candidates;
 }
@@ -448,6 +619,18 @@ static DWORD WINAPI scan_thread(LPVOID param) {
             Sleep(delays[pass]);
         }
 
+        /* Bekleme sırasında limit dolmuşsa kalan geçişleri atla */
+        if (memscan_is_done()) {
+            if (g_log_crypto) {
+                log_time(g_log_crypto);
+                fprintf(g_log_crypto,
+                    "=== scan_thread: limit dolu, GEÇİŞ %d..%d atlanıyor ===\n\n",
+                    pass + 1, NPASS);
+                fflush(g_log_crypto);
+            }
+            break;
+        }
+
         FILE *f = g_log_crypto;
         FILE *fb = NULL;
         if (!f) {
@@ -472,9 +655,13 @@ static DWORD WINAPI scan_thread(LPVOID param) {
     return 0;
 }
 
-/* Anında (0-delay) tek tarama — recv hook'tan tetiklenir */
+/* Anında (0-delay) tek tarama — recv/send/connect hook'tan tetiklenir */
 static DWORD WINAPI immediate_scan_thread(LPVOID param) {
     (void)param;
+
+    /* Limit dolmuşsa hiç çalışma */
+    if (memscan_is_done()) return 0;
+
     FILE *f = g_log_crypto;
     FILE *fb = NULL;
     if (!f) {
@@ -525,7 +712,7 @@ static int WINAPI hook_connect(SOCKET s,
         }
         /* Port 39190: key exchange connect() SONRASI hemen gerçekleşir —
          * recv hook'tan önce anında tarama başlat */
-        if (port == GAME_PORT) {
+        if (port == GAME_PORT && !memscan_is_done()) {
             if (g_log_crypto) {
                 log_time(g_log_crypto);
                 fprintf(g_log_crypto,
@@ -556,7 +743,7 @@ static int WINAPI hook_send(SOCKET s, const char *buf, int len, int flags) {
         struct sockaddr_in sa; int sl = sizeof(sa);
         if (getpeername(s, (struct sockaddr*)&sa, &sl) == 0) {
             uint16_t port = ntohs(sa.sin_port);
-            if (port == GAME_PORT) {
+            if (port == GAME_PORT && !memscan_is_done()) {
                 LONG cnt = InterlockedIncrement(&g_send_scan_count);
                 if (cnt <= 2) {
                     if (g_log_crypto) {
@@ -602,9 +789,9 @@ static int WINAPI hook_recv(SOCKET s, char *buf, int len, int flags) {
         if (getpeername(s, (struct sockaddr*)&sa, &sl) == 0) {
             uint16_t port = ntohs(sa.sin_port);
             if (port == GAME_PORT) {
-                /* İlk 3 game-server recv'de anında tarama yap */
+                /* İlk 3 game-server recv'de anında tarama yap — limit dolmamışsa */
                 LONG cnt = InterlockedIncrement(&g_recv_scan_count);
-                if (cnt <= 3) {
+                if (cnt <= 3 && !memscan_is_done()) {
                     HANDLE t = CreateThread(NULL, 0, immediate_scan_thread, NULL, 0, NULL);
                     if (t) {
                         /* Store handle for safe join at DLL_PROCESS_DETACH */
@@ -849,6 +1036,7 @@ static void OSSL_CC hook_BF_cfb64_inline(
         fprintf(g_log_crypto, "BF_cfb64 [inline] — %s len=%ld\n",
                 enc == 1 ? "ENC" : "DEC", length);
         log_hex(g_log_crypto, "ivec", ivec, 8);
+        log_ivec_endian(g_log_crypto, ivec);
         log_hex(g_log_crypto, "in", in, (int)length);
         /* BF_KEY: ilk 72 byte = P-array */
         log_hex(g_log_crypto, "key(P[0:8])",
@@ -1035,6 +1223,19 @@ static BOOL CALLBACK do_init(PINIT_ONCE p, PVOID param, PVOID *ctx) {
     /* Log dosyalarını aç */
     g_log_crypto = open_log("pb_crypto.log");
     g_log_net    = open_log("pb_net.log");
+    g_log_plain  = open_log("pb_plain.log");
+    if (g_log_plain) {
+        fprintf(g_log_plain,
+            "# ========================================\n"
+            "# pb_plain.log — PointBlank plaintext log\n"
+            "# PID %lu\n"
+            "# Kolon: #seq  YON  total  len_field  proto  op  payload\n"
+            "# SEND → enc=1 in=plaintext  /  RECV ← enc=0 out=plaintext\n"
+            "# Paket fmt: [1B len][1B 0x0D][1B opcode][payload]\n"
+            "# ========================================\n",
+            GetCurrentProcessId());
+        fflush(g_log_plain);
+    }
 
     if (g_log_crypto) {
         fprintf(g_log_crypto,
@@ -1148,20 +1349,41 @@ BF_cfb64_encrypt(const unsigned char *in, unsigned char *out,
                  unsigned char *ivec, int *num, int enc) {
     ensure_init();
     InterlockedIncrement(&g_bf_export_calls);
-    OutputDebugStringA("[pb_proxy] BF_cfb64_encrypt EXPORT called\n");
+
+    /* ── pb_plain.log: SEND plaintext (enc=1 → 'in' = şifrelenmemiş veri) ── */
+    if (enc == 1 && g_log_plain && in && length > 0) {
+        int seq = (int)InterlockedIncrement(&g_plain_call_seq);
+        log_pb_plain_pkt(g_log_plain, "SEND \xe2\x86\x92",
+                         in, (int)length, seq);
+        log_pb_hexdump(g_log_plain, in, (int)length);
+    }
+
+    /* ── pb_crypto.log: teknik detay (ivec, key özeti, ham 'in') ── */
     if (g_log_crypto) {
         log_time(g_log_crypto);
         fprintf(g_log_crypto, "BF_cfb64_encrypt EXPORT — %s, len=%ld  [call#%ld]\n",
                 enc == 1 ? "ENCRYPT" : "DECRYPT", length,
                 (long)g_bf_export_calls);
         log_hex(g_log_crypto, "ivec", ivec, 8);
+        log_ivec_endian(g_log_crypto, ivec);
         log_hex(g_log_crypto, "in", in, (int)length);
         log_hex(g_log_crypto, "key P-array[0:32]",
                 (const unsigned char*)key, 32);
         fflush(g_log_crypto);
     }
+
     if (real_BF_cfb64_encrypt)
         real_BF_cfb64_encrypt(in, out, length, key, ivec, num, enc);
+
+    /* ── pb_plain.log: RECV plaintext (enc=0 → 'out' = çözülmüş veri) ── */
+    if (enc == 0 && g_log_plain && out && length > 0) {
+        int seq = (int)InterlockedIncrement(&g_plain_call_seq);
+        log_pb_plain_pkt(g_log_plain, "RECV \xe2\x86\x90",
+                         out, (int)length, seq);
+        log_pb_hexdump(g_log_plain, out, (int)length);
+    }
+
+    /* ── pb_crypto.log: çözülmüş çıktı (sadece DEC) ── */
     if (g_log_crypto && enc == 0) {
         log_hex(g_log_crypto, "out (decrypted)", out, (int)length);
         fflush(g_log_crypto);
@@ -1294,6 +1516,10 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD reason, LPVOID reserved) {
             }
         }
         if (g_scan_cs_init) { DeleteCriticalSection(&g_scan_cs); g_scan_cs_init = FALSE; }
+        if (g_log_plain) {
+            fprintf(g_log_plain, "# proxy kaldirildi.\n");
+            fclose(g_log_plain); g_log_plain = NULL;
+        }
         if (g_log_crypto) {
             fprintf(g_log_crypto, "proxy kaldirildi.\n");
             fclose(g_log_crypto); g_log_crypto = NULL;
