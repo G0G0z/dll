@@ -256,10 +256,28 @@ class Session:
         self.n_recv  = 0        # RECV akışının blok içi ofseti (0-7)
         self.iv_send = None     # SEND akışının mevcut CFB IV'i
         self.n_send  = 0        # SEND akışının blok içi ofseti (0-7)
-        self.dll_ws    = None
+        # DLL bağlantıları — birden fazla instance aynı anda bağlı olabilir
+        self.dll_clients: set = set()   # tüm aktif DLL WebSocket'leri
+        self._dll_ws_latest = None      # injection için en son bağlanan DLL
         self.ui_clients = set()
         self.packets   = []
         self.seq       = 0
+        # ── Oyuncu takibi ──────────────────────────────────────────────────
+        self.players: dict[int, dict] = {}   # player_id → player_dict
+        self.game_state: str = 'lobby'       # 'lobby' | 'room' | 'ingame'
+        self.room_id: int = 0
+
+    @property
+    def dll_ws(self):
+        """Injection için en son bağlanan DLL WebSocket'ini döndür."""
+        if self._dll_ws_latest and not self._dll_ws_latest.closed:
+            return self._dll_ws_latest
+        # latest kapanmışsa set'ten açık olanı seç
+        for ws in self.dll_clients:
+            if not ws.closed:
+                self._dll_ws_latest = ws
+                return ws
+        return None
 
     def has_key(self): return self.P is not None
     def has_iv(self):  return self.iv is not None
@@ -341,6 +359,210 @@ class Session:
 
 session = Session()
 
+# ─── Protocol Decoder ────────────────────────────────────────────────────────
+#
+# Opcode tablosu: 0xNN → (kısa_ad, yön_ipucu, açıklama)
+# yön_ipucu: 'C→S' = client→server, 'S→C' = server→client, '?' = bilinmiyor
+# Yeni opcode eklemek için buraya satır ekle; proxy yeniden başlatmaya gerek yok
+# (sunucu yeniden başlatılınca tablo güncellenir).
+_OPCODES: dict[int, tuple[str, str, str]] = {
+    # ── Bağlantı / Oturum ──────────────────────────────────────
+    0x01: ('CONNECT',       '?',   'Bağlantı isteği / ilk握手'),
+    0x02: ('PING',          '?',   'Bağlantı canlı tutma — ping'),
+    0x03: ('PONG',          '?',   'Bağlantı canlı tutma — pong'),
+    0x04: ('DISCONNECT',    '?',   'Bağlantı kesme bildirimi'),
+    # ── Giriş / Kimlik ──────────────────────────────────────────
+    0x14: ('LOGIN_REQ',     'C→S', 'Kullanıcı adı + şifre/hash gönderimi'),
+    0x15: ('LOGIN_ACK',     'S→C', 'Login yanıtı (başarı/hata kodu)'),
+    0x16: ('AUTH_TOKEN',    'C→S', 'Kimlik doğrulama token\'ı'),
+    0x17: ('USER_INFO',     'S→C', 'Kullanıcı bilgileri (seviye, deneyim)'),
+    0x18: ('CHAR_SELECT',   'C→S', 'Karakter / slot seçimi'),
+    # ── Lobi / Kanal ────────────────────────────────────────────
+    0x1e: ('LOBBY_LIST',    'S→C', 'Lobi / kanal listesi'),
+    0x1f: ('CHANNEL_JOIN',  'C→S', 'Kanala giriş isteği'),
+    0x20: ('CHANNEL_ACK',   'S→C', 'Kanal giriş yanıtı'),
+    0x21: ('PLAYER_LIST',   'S→C', 'Kanaldaki oyuncu listesi'),
+    0x22: ('PLAYER_ENTER',  'S→C', 'Kanala yeni oyuncu girdi'),
+    0x23: ('PLAYER_LEAVE',  'S→C', 'Kanaldan oyuncu çıktı'),
+    # ── Oda ─────────────────────────────────────────────────────
+    0x28: ('ROOM_LIST',     'S→C', 'Oda listesi'),
+    0x29: ('ROOM_CREATE',   'C→S', 'Oda oluşturma isteği'),
+    0x2a: ('ROOM_JOIN',     'C→S', 'Odaya katılma isteği'),
+    0x2b: ('ROOM_LEAVE',    'C→S', 'Odadan ayrılma'),
+    0x2c: ('ROOM_ACK',      'S→C', 'Oda işlemi yanıtı'),
+    0x2d: ('ROOM_INFO',     'S→C', 'Oda bilgisi (harita, mod, oyuncular)'),
+    0x2e: ('ROOM_READY',    'C→S', 'Hazır butonu'),
+    0x2f: ('ROOM_KICK',     'S→C', 'Odadan atıldı'),
+    # ── Oyun ────────────────────────────────────────────────────
+    0x32: ('GAME_START',    'S→C', 'Oyun başladı — harita ve takım bilgisi'),
+    0x33: ('GAME_END',      'S→C', 'Oyun bitti — skor tablosu'),
+    0x34: ('ROUND_START',   'S→C', 'Tur başladı'),
+    0x35: ('ROUND_END',     'S→C', 'Tur bitti'),
+    0x36: ('MAP_DATA',      'S→C', 'Harita verisi / spawn noktaları'),
+    # ── Oyuncu Durumu ───────────────────────────────────────────
+    0x3c: ('SPAWN',         'S→C', 'Spawn koordinatları + takım'),
+    0x3d: ('MOVE',          'both','Hareket paketi (konum + açı)'),
+    0x3e: ('JUMP',          'C→S', 'Zıplama'),
+    0x3f: ('CROUCH',        'C→S', 'Çömelme'),
+    0x40: ('STANCE',        'both','Duruş değişikliği'),
+    # ── Silah / Savaş ───────────────────────────────────────────
+    0x46: ('SHOOT',         'C→S', 'Ateş paketi — silah ve hedef'),
+    0x47: ('HIT',           'S→C', 'Vurma bildirimi — hasar + vuran'),
+    0x48: ('MISS',          'S→C', 'Ateş ıskalaması'),
+    0x49: ('RELOAD',        'C→S', 'Şarjör doldurma'),
+    0x4a: ('WEAPON_SWITCH', 'C→S', 'Silah değiştirme'),
+    0x4b: ('PLAYER_DEAD',   'S→C', 'Ölüm bildirimi — ölen ve öldüren'),
+    0x4e: ('GRENADE',       'C→S', 'El bombası fırlatma'),
+    0x4f: ('EXPLOSION',     'S→C', 'Patlama efekti'),
+    # ── Sohbet ──────────────────────────────────────────────────
+    0x4c: ('CHAT',          'both','Sohbet mesajı'),
+    0x5b: ('SYSTEM_MSG',    'S→C', 'Sistem mesajı / duyuru'),
+    # ── Skor / İstatistik ───────────────────────────────────────
+    0x50: ('SCORE',         'S→C', 'Skor güncellemesi'),
+    0x51: ('KILL_FEED',     'S→C', 'Kill/ölüm özeti'),
+    0x52: ('STATS',         'S→C', 'Oyun sonu istatistikleri'),
+    # ── Envanter / Mağaza ───────────────────────────────────────
+    0x5a: ('SHOP_BUY',      'C→S', 'Eşya / silah satın alma'),
+    0x5c: ('INVENTORY',     'S→C', 'Envanter listesi'),
+    0x5d: ('EQUIP',         'C→S', 'Eşya donatma'),
+    # ── Diğer ───────────────────────────────────────────────────
+    0x64: ('HEARTBEAT',     'both','Uygulama seviyesi canlı tutma'),
+    0x6e: ('SERVER_INFO',   'S→C', 'Sunucu bilgisi (IP, port, bölge)'),
+    0x78: ('CLAN_INFO',     'S→C', 'Klan bilgisi'),
+}
+
+def _ascii_safe(b: bytes) -> str:
+    return ''.join(chr(x) if 0x20 <= x < 0x7f else '.' for x in b)
+
+def _try_string(data: bytes, offset: int) -> tuple[str, int]:
+    """[1B len][bytes] Pascal string okur; geçersizse hex döndürür."""
+    if offset >= len(data): return '', offset
+    slen = data[offset]; offset += 1
+    raw = data[offset:offset + slen]
+    try:   text = raw.decode('utf-8', errors='replace')
+    except Exception: text = raw.hex()
+    return text, offset + slen
+
+def _decode_fields(opcode_byte: int, payload: bytes, direction: str) -> list[dict]:
+    """Opcode'a göre payload alanlarını ayrıştır. Bilinmeyen → hex dump."""
+    fields: list[dict] = []
+
+    def f(name, value, kind='val'):
+        fields.append({'n': name, 'v': str(value), 'k': kind})
+
+    try:
+        if opcode_byte == 0x02 and len(payload) >= 4:   # PING
+            f('Timestamp', struct.unpack_from('<I', payload)[0], 'u32')
+
+        elif opcode_byte == 0x14 and len(payload) >= 1:  # LOGIN_REQ
+            uname, off = _try_string(payload, 0)
+            f('Kullanıcı adı', uname, 'str')
+            if off < len(payload):
+                f('Şifre/Hash', payload[off:off+32].hex(), 'hex')
+
+        elif opcode_byte == 0x15 and len(payload) >= 1:  # LOGIN_ACK
+            code = payload[0]
+            names = {0: 'Başarılı', 1: 'Hatalı şifre', 2: 'Hesap yok',
+                     3: 'Zaten giriş yapıldı', 4: 'Sunucu dolu'}
+            f('Sonuç', f"0x{code:02x} — {names.get(code, 'Bilinmiyor')}", 'status')
+            if len(payload) >= 5:
+                uid = struct.unpack_from('<I', payload, 1)[0]
+                f('Kullanıcı ID', uid, 'u32')
+
+        elif opcode_byte == 0x3d and len(payload) >= 12: # MOVE
+            x, y, z = struct.unpack_from('<fff', payload, 0)
+            f('X', f'{x:.3f}', 'float')
+            f('Y', f'{y:.3f}', 'float')
+            f('Z', f'{z:.3f}', 'float')
+            if len(payload) >= 14:
+                yaw   = struct.unpack_from('<H', payload, 12)[0]
+                f('Yaw (açı)', f'{yaw} ({yaw/65535*360:.1f}°)', 'u16')
+
+        elif opcode_byte == 0x47 and len(payload) >= 6:  # HIT
+            attacker = struct.unpack_from('<H', payload, 0)[0]
+            victim   = struct.unpack_from('<H', payload, 2)[0]
+            damage   = struct.unpack_from('<H', payload, 4)[0]
+            f('Saldıran ID', attacker, 'u16')
+            f('Hedef ID',    victim,   'u16')
+            f('Hasar',       damage,   'u16')
+            if len(payload) >= 7:
+                zone_map = {0:'Gövde', 1:'Kafa', 2:'Sol kol', 3:'Sağ kol',
+                            4:'Sol bacak', 5:'Sağ bacak'}
+                zone = payload[6]
+                f('Bölge', f"{zone_map.get(zone, f'0x{zone:02x}')}", 'val')
+
+        elif opcode_byte == 0x4b and len(payload) >= 4:  # PLAYER_DEAD
+            killer = struct.unpack_from('<H', payload, 0)[0]
+            victim = struct.unpack_from('<H', payload, 2)[0]
+            f('Öldüren ID', killer, 'u16')
+            f('Ölen ID',    victim, 'u16')
+            if len(payload) >= 5:
+                weapon = payload[4]
+                f('Silah kodu', f'0x{weapon:02x}', 'hex')
+
+        elif opcode_byte == 0x4c and len(payload) >= 2:  # CHAT
+            sender, off = _try_string(payload, 0)
+            if off < len(payload):
+                msg, _ = _try_string(payload, off)
+                f('Gönderen', sender, 'str')
+                f('Mesaj',    msg,    'str')
+
+        elif opcode_byte == 0x50 and len(payload) >= 4:  # SCORE
+            team_a = struct.unpack_from('<H', payload, 0)[0]
+            team_b = struct.unpack_from('<H', payload, 2)[0]
+            f('Takım A', team_a, 'u16')
+            f('Takım B', team_b, 'u16')
+
+        elif opcode_byte == 0x32 and len(payload) >= 2:  # GAME_START
+            map_id = struct.unpack_from('<H', payload, 0)[0]
+            f('Harita ID', map_id, 'u16')
+            if len(payload) >= 3:
+                mode = payload[2]
+                modes = {0:'Deathmatch', 1:'Team DM', 2:'Bomba', 3:'Bayrak'}
+                f('Mod', f"{modes.get(mode, f'0x{mode:02x}')}", 'val')
+
+        elif opcode_byte == 0x3c and len(payload) >= 12: # SPAWN
+            x, y, z = struct.unpack_from('<fff', payload, 0)
+            f('Spawn X', f'{x:.1f}', 'float')
+            f('Spawn Y', f'{y:.1f}', 'float')
+            f('Spawn Z', f'{z:.1f}', 'float')
+            if len(payload) >= 13:
+                team = payload[12]
+                f('Takım', 'Mavi' if team == 0 else ('Kırmızı' if team == 1 else f'0x{team:02x}'), 'val')
+
+    except Exception:
+        pass  # parse hatası → sadece hex dump göster
+
+    return fields
+
+def decode_packet(opcode_byte: int, payload: bytes, direction: str) -> dict:
+    """Paketi ayrıştır: isim + açıklama + alanlar + hex dump döndür."""
+    entry = _OPCODES.get(opcode_byte)
+    name  = entry[0] if entry else f'UNK_{opcode_byte:02X}'
+    hint  = entry[1] if entry else '?'
+    desc  = entry[2] if entry else 'Bilinmeyen opcode — ham veri gösteriliyor'
+
+    fields = _decode_fields(opcode_byte, payload, direction)
+
+    # Hex dump (her zaman eklenir)
+    dump_rows = []
+    for i in range(0, len(payload), 16):
+        chunk = payload[i:i+16]
+        dump_rows.append({
+            'off': f'{i:04x}',
+            'hex': ' '.join(f'{b:02x}' for b in chunk),
+            'asc': _ascii_safe(chunk),
+        })
+
+    return {
+        'name':   name,
+        'hint':   hint,
+        'desc':   desc,
+        'fields': fields,
+        'dump':   dump_rows,
+        'pay_len': len(payload),
+    }
+
 # ─── Paket formatlama ─────────────────────────────────────────────────────────
 
 def fmt_packet(seq, direction, raw, plain, ts=None):
@@ -360,21 +582,32 @@ def fmt_packet(seq, direction, raw, plain, ts=None):
     base['plain_hex']   = plain.hex()
     base['len_field']   = plain[0] if plain else None
     base['proto']       = plain[1] if len(plain) > 1 else None
-    base['opcode']      = plain[2] if len(plain) > 2 else None
     base['payload_hex'] = plain[3:67].hex() if len(plain) > 3 else ''
+
+    op_byte = plain[2] if len(plain) > 2 else None
+    base['opcode'] = op_byte
 
     expected = (size - 3) & 0xFF
     len_ok   = (base['len_field'] == expected and size <= 258)
     proto_ok = (base['proto'] == 0x0D)
 
     if len_ok and proto_ok:         base['status'] = 'ok'
-    elif proto_ok and not len_ok:   base['status'] = 'large'    # multi-frame
+    elif proto_ok and not len_ok:   base['status'] = 'large'
     elif len_ok and not proto_ok:   base['status'] = 'proto?'
     else:                           base['status'] = 'mismatch'
 
-    # Human-readable
-    if base['opcode'] is not None:
-        base['opcode'] = f"0x{base['opcode']:02x}"
+    # Decode packet fields
+    if op_byte is not None:
+        payload = plain[3:]
+        dec = decode_packet(op_byte, payload, direction)
+        base['decoded'] = dec
+        base['pkt_name'] = dec['name']
+        base['opcode'] = f"0x{op_byte:02x}"
+    else:
+        base['decoded'] = None
+        base['pkt_name'] = ''
+        base['opcode'] = None
+
     if base['proto'] is not None:
         base['proto'] = f"0x{base['proto']:02x}"
     return base
@@ -398,21 +631,22 @@ def _clear_log_data():
         print(f'[SESSION] Eski log dosyaları silindi: {", ".join(deleted)}')
 
 async def dll_handler(request):
-    # heartbeat=30 → her 30s ping gönderir, Replit proxy idle timeout'u önler
-    ws = web.WebSocketResponse(max_msg_size=8 * 1024 * 1024, heartbeat=30.0)
+    # heartbeat=None — WinHTTP PING/PONG'u protokol seviyesinde kendisi yönetir;
+    # sunucu taraflı heartbeat WinHttpWebSocketReceive'i bozup bağlantıyı kesebilir.
+    # Replit proxy idle timeout için uygulama seviyesinde keepalive kullanıyoruz.
+    ws = web.WebSocketResponse(max_msg_size=8 * 1024 * 1024, heartbeat=None)
     await ws.prepare(request)
 
     peer = request.remote or '?'
-    print(f'[DLL] Bağlandı: {peer}')
-    # Eski bağlantıyı kapat (yeni bağlantı geldi)
-    if session.dll_ws is not None and not session.dll_ws.closed:
-        await session.dll_ws.close()
-    session.dll_ws = ws
+    session.dll_clients.add(ws)
+    session._dll_ws_latest = ws
+    dll_count = len(session.dll_clients)
+    print(f'[DLL] Bağlandı: {peer}  (aktif={dll_count})')
 
-    # NOT: Oturum state'i burada sıfırlanmıyor.
-    # Yeniden bağlantı (kopup tekrar bağlanma) normal — state korunmalı.
-    # Gerçek yeni oyun oturumu challenge frame'iyle tespit edilir.
-    await broadcast({'type': 'dll_connected', 'peer': peer})
+    # NOT: Eski bağlantılar zorla kapatılmıyor — DLL yeniden bağlanma döngüsüne
+    # girmeden kendi kapanmasını bekle. Yeni oyun oturumu challenge frame'iyle tespit edilir.
+    await broadcast({'type': 'dll_connected', 'peer': peer,
+                     'count': dll_count})
 
     try:
         async for msg in ws:
@@ -421,12 +655,17 @@ async def dll_handler(request):
             elif msg.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.ERROR):
                 break
     finally:
-        if session.dll_ws is ws:
-            session.dll_ws = None
-            print(f'[DLL] Bağlantı kesildi: {peer}')
+        session.dll_clients.discard(ws)
+        if session._dll_ws_latest is ws:
+            session._dll_ws_latest = None
+        remaining = len(session.dll_clients)
+        print(f'[DLL] Bağlantı kesildi: {peer}  (kalan={remaining})')
+        if remaining == 0:
             await broadcast({'type': 'dll_disconnected'})
         else:
-            print(f'[DLL] Eski bağlantı kapandı (yeni bağlantı devrede): {peer}')
+            await broadcast({'type': 'dll_connected',
+                             'peer': '(diğer bağlantı devrede)',
+                             'count': remaining})
 
     return ws
 
@@ -482,8 +721,9 @@ async def _redecrypt_session():
             ev['plain_hex']   = plain.hex()
             ev['len_field']   = plain[0] if plain else None
             ev['proto']       = plain[1] if len(plain) > 1 else None
-            ev['opcode']      = plain[2] if len(plain) > 2 else None
             ev['payload_hex'] = plain[3:67].hex() if len(plain) > 3 else ''
+            op_byte           = plain[2] if len(plain) > 2 else None
+            ev['opcode']      = op_byte
             expected  = (ev['size'] - 3) & 0xFF
             len_ok    = (ev['len_field'] == expected and ev['size'] <= 258)
             proto_ok  = (ev['proto'] == 0x0D)
@@ -491,7 +731,11 @@ async def _redecrypt_session():
             elif proto_ok and not len_ok:  ev['status'] = 'large'
             elif len_ok and not proto_ok:  ev['status'] = 'proto?'
             else:                          ev['status'] = 'mismatch'
-            if ev['opcode'] is not None:   ev['opcode'] = f"0x{ev['opcode']:02x}"
+            if op_byte is not None:
+                dec = decode_packet(op_byte, plain[3:], ev.get('dir','R'))
+                ev['decoded']   = dec
+                ev['pkt_name']  = dec['name']
+                ev['opcode']    = f"0x{op_byte:02x}"
             if ev['proto']  is not None:   ev['proto']  = f"0x{ev['proto']:02x}"
             ev['note'] = 'retroaktif çözüldü'
             if ev['status'] != status:
@@ -572,11 +816,214 @@ async def on_dll_frame(data: bytes):
     session.seq += 1
     _store(ev)
     await broadcast({'type': 'packet', 'pkt': ev})
+    if _track_event(ev):
+        await broadcast({'type': 'players_update',
+                         'players':    list(session.players.values()),
+                         'game_state': session.game_state})
 
 def _store(ev):
     session.packets.append(ev)
     if len(session.packets) > 500:
         session.packets = session.packets[-500:]
+
+# ─── Rütbe adları ────────────────────────────────────────────────────────────
+
+RANK_NAMES: dict[int, str] = {
+    0:  'Acemi',      1:  'Er',          2:  'Onbaşı',
+    3:  'Çavuş',      4:  'Üstçavuş',    5:  'Başçavuş',
+    6:  'Teğmen',     7:  'Üsteğmen',    8:  'Yüzbaşı',
+    9:  'Binbaşı',    10: 'Yarbay',      11: 'Albay',
+    12: 'Tuğgeneral', 13: 'Tümgeneral',  14: 'Korgeneral',
+    15: 'Orgeneral',  16: 'Mareşal',
+}
+
+# ─── Oyuncu takip motoru ──────────────────────────────────────────────────────
+
+def _player_ensure(pid: int, ts: str) -> dict:
+    if pid not in session.players:
+        session.players[pid] = {
+            'id': pid, 'name': f'Oyuncu-{pid}', 'rank': 0,
+            'rank_name': 'Acemi', 'team': -1, 'alive': False,
+            'in_game': False, 'kills': 0, 'deaths': 0, 'score': 0,
+            'seen_at': ts,
+        }
+    return session.players[pid]
+
+def _parse_player_entry(payload: bytes, ts: str, in_game: bool = False) -> bool:
+    """Genel oyuncu giriş formatı: [2B id][1B name_len][name…][1B rank][1B team]"""
+    try:
+        if len(payload) < 4:
+            return False
+        pid      = struct.unpack_from('<H', payload, 0)[0]
+        name_len = payload[2]
+        if 3 + name_len > len(payload):
+            return False
+        name = payload[3:3 + name_len].decode('utf-8', errors='replace').strip('\x00')
+        rank = payload[3 + name_len]     if (3 + name_len)     < len(payload) else 0
+        team = payload[4 + name_len]     if (4 + name_len)     < len(payload) else -1
+        p = _player_ensure(pid, ts)
+        if name: p['name'] = name
+        p['rank']      = rank
+        p['rank_name'] = RANK_NAMES.get(rank, f'Rütbe-{rank}')
+        if team != 0xFF: p['team'] = team
+        p['in_game']   = True
+        p['alive']     = in_game
+        p['seen_at']   = ts
+        return True
+    except Exception:
+        return False
+
+def _parse_player_list(payload: bytes, ts: str) -> bool:
+    """PLAYER_LIST: [1B count][oyuncu giriş…]"""
+    try:
+        count   = payload[0]
+        offset  = 1
+        changed = False
+        for _ in range(min(count, 32)):
+            if offset + 4 > len(payload):
+                break
+            name_len = payload[offset + 2]
+            changed |= _parse_player_entry(payload[offset:], ts,
+                                           in_game=(session.game_state == 'ingame'))
+            offset += 3 + name_len + 2   # id(2) + len(1) + name + rank(1) + team(1)
+        return changed
+    except Exception:
+        return False
+
+def _track_event(ev: dict) -> bool:
+    """Paketten oyuncu durumunu güncelle. Değişiklik olduysa True döndür."""
+    if ev.get('status') not in ('ok', 'large'):
+        return False
+    op_str = ev.get('opcode', '')
+    if not op_str:
+        return False
+    try:
+        op = int(op_str, 16)
+    except ValueError:
+        return False
+    plain_hex = ev.get('plain_hex', '')
+    if not plain_hex:
+        return False
+    try:
+        plain = bytes.fromhex(plain_hex)
+    except ValueError:
+        return False
+    payload = plain[3:]   # [len][proto][opcode] → payload
+    ts      = ev.get('ts', time.strftime('%H:%M:%S'))
+    changed = False
+
+    try:
+        if op == 0x32:               # GAME_START
+            session.game_state = 'ingame'
+            for p in session.players.values():
+                p['in_game'] = True
+                p['alive']   = True
+                p['kills']   = 0
+                p['deaths']  = 0
+                p['score']   = 0
+            changed = True
+
+        elif op == 0x33:             # GAME_END
+            session.game_state = 'room'
+            for p in session.players.values():
+                p['alive']   = False
+                p['in_game'] = False
+            changed = True
+
+        elif op == 0x22 and len(payload) >= 4:  # PLAYER_ENTER
+            changed = _parse_player_entry(payload, ts,
+                                          in_game=(session.game_state == 'ingame'))
+
+        elif op == 0x21 and len(payload) >= 1:  # PLAYER_LIST
+            changed = _parse_player_list(payload, ts)
+
+        elif op == 0x23 and len(payload) >= 2:  # PLAYER_LEAVE
+            pid = struct.unpack_from('<H', payload, 0)[0]
+            if pid in session.players:
+                session.players[pid]['in_game'] = False
+                session.players[pid]['alive']   = False
+                changed = True
+
+        elif op == 0x4b and len(payload) >= 4:  # PLAYER_DEAD
+            killer = struct.unpack_from('<H', payload, 0)[0]
+            victim = struct.unpack_from('<H', payload, 2)[0]
+            if victim in session.players:
+                session.players[victim]['alive']  = False
+                session.players[victim]['deaths'] += 1
+                changed = True
+            if killer in session.players and killer != victim:
+                session.players[killer]['kills'] += 1
+                changed = True
+
+        elif op == 0x3c and len(payload) >= 2:  # SPAWN — oyuncu yeniden doğdu
+            # Spawn paketinde genellikle pid yoktur; koordinatlardan hangisi bilinmez.
+            # Güvenli yaklaşım: tüm oyuncuların alive durumunu koruyalım.
+            pass
+
+        elif op in (0x17, 0x4d) and len(payload) >= 3:  # USER_INFO / PLAYER_INFO
+            changed = _parse_player_entry(payload, ts,
+                                          in_game=(session.game_state == 'ingame'))
+    except Exception:
+        pass
+    return changed
+
+# ─── Oyuncu eylem paket yapıcıları ───────────────────────────────────────────
+# NOT: Bu formatlar PB özel sunucu protokolüne dayalı en iyi tahmindir.
+# Gerçek admin paketleri yakalandıkça güncelleyin.
+
+def _mk_pkt(opcode: int, payload: bytes) -> bytes:
+    """[len_field][0x0D][opcode][payload]"""
+    return bytes([len(payload) & 0xFF, 0x0D, opcode]) + payload
+
+def build_kill_pkt(target_id: int) -> bytes:
+    """Admin öldür: opcode 0x60, eylem=0x01, hedef"""
+    return _mk_pkt(0x60, struct.pack('<BH', 0x01, target_id))
+
+def build_kick_pkt(target_id: int, reason: int = 0) -> bytes:
+    """Odadan at: opcode 0x62, hedef + sebep"""
+    return _mk_pkt(0x62, struct.pack('<HB', target_id, reason))
+
+def build_edit_name_pkt(target_id: int, new_name: str) -> bytes:
+    """İsim değiştir: opcode 0x65, hedef + [len][name]"""
+    nb = new_name.encode('utf-8')[:32]
+    return _mk_pkt(0x65, struct.pack('<HB', target_id, len(nb)) + nb)
+
+def build_edit_rank_pkt(target_id: int, new_rank: int) -> bytes:
+    """Rütbe değiştir: opcode 0x66, hedef + rütbe"""
+    return _mk_pkt(0x66, struct.pack('<HH', target_id, new_rank & 0xFF))
+
+def build_give_item_pkt(target_id: int, item_id: int,
+                         qty: int = 1, days: int = 0) -> bytes:
+    """Eşya ver: opcode 0x67, hedef + item_id + adet + gün"""
+    return _mk_pkt(0x67, struct.pack('<HHHH', target_id, item_id, qty & 0xFFFF, days & 0xFFFF))
+
+def build_teleport_pkt(target_id: int, x: float, y: float, z: float) -> bytes:
+    """Işınla: opcode 0x68, hedef + xyz float"""
+    return _mk_pkt(0x68, struct.pack('<Hfff', target_id, x, y, z))
+
+async def _inject_plain(ws, plain: bytes, action_label: str, pid: int):
+    """Plaintext paketi şifrele ve DLL'e gönder; sonucu ws'e bildir."""
+    if not session.dll_ws:
+        await ws.send_json({'type': 'action_error', 'msg': 'DLL bağlı değil'})
+        return
+    if not session.has_key() or not session.has_iv():
+        await ws.send_json({'type': 'action_error', 'msg': 'Anahtar / IV yok'})
+        return
+    cipher = session.encrypt(plain)
+    frame  = bytes([0x49, 0x00]) + struct.pack('<I', len(cipher)) + cipher
+    try:
+        await session.dll_ws.send_bytes(frame)
+        pname = session.players.get(pid, {}).get('name', f'ID={pid}')
+        await ws.send_json({
+            'type':      'action_ok',
+            'action':    action_label,
+            'pid':       pid,
+            'pname':     pname,
+            'plain_hex': plain.hex(),
+            'msg':       f'✓ {action_label} → {pname} (plain: {plain.hex()})',
+        })
+    except Exception as e:
+        await ws.send_json({'type': 'action_error', 'msg': str(e)})
 
 # ─── WebSocket: Tarayıcı bağlantısı (/ui) ────────────────────────────────────
 
@@ -585,7 +1032,7 @@ async def ui_handler(request):
     await ws.prepare(request)
     session.ui_clients.add(ws)
 
-    # İlk bağlantıda geçmiş + durumu gönder
+    # İlk bağlantıda geçmiş + durum + oyuncu listesi gönder
     await ws.send_json({
         'type':       'init',
         'dll_status': 'connected' if session.dll_ws else 'disconnected',
@@ -593,6 +1040,8 @@ async def ui_handler(request):
         'has_iv':     session.has_iv(),
         'iv':         session.iv.hex() if session.iv else None,
         'history':    session.packets[-200:],
+        'players':    list(session.players.values()),
+        'game_state': session.game_state,
     })
 
     try:
@@ -699,6 +1148,45 @@ async def on_ui_cmd(ws, cmd):
         await broadcast({'type': 'status', 'msg': msg, 'level': 'ok'})
         await _redecrypt_session()
 
+    elif t == 'player_action':
+        action = cmd.get('action', '')
+        try:
+            pid = int(cmd.get('pid', 0))
+        except (ValueError, TypeError):
+            await ws.send_json({'type': 'action_error', 'msg': 'Geçersiz pid'}); return
+
+        _builders = {
+            'kill':      lambda: build_kill_pkt(pid),
+            'kick':      lambda: build_kick_pkt(pid, int(cmd.get('reason', 0))),
+            'edit_name': lambda: build_edit_name_pkt(pid, str(cmd.get('name', ''))[:32]),
+            'edit_rank': lambda: build_edit_rank_pkt(pid, int(cmd.get('rank', 0))),
+            'give_item': lambda: build_give_item_pkt(
+                pid, int(cmd.get('item_id', 0)),
+                int(cmd.get('qty', 1)), int(cmd.get('days', 0))),
+            'teleport':  lambda: build_teleport_pkt(
+                pid, float(cmd.get('x', 0.0)),
+                float(cmd.get('y', 0.0)), float(cmd.get('z', 0.0))),
+        }
+        if action not in _builders:
+            await ws.send_json({'type': 'action_error', 'msg': f'Bilinmeyen eylem: {action}'}); return
+        try:
+            plain = _builders[action]()
+        except Exception as e:
+            await ws.send_json({'type': 'action_error', 'msg': f'Paket oluşturulamadı: {e}'}); return
+        await _inject_plain(ws, plain, action, pid)
+
+    elif t == 'get_players':
+        await ws.send_json({
+            'type':       'players_update',
+            'players':    list(session.players.values()),
+            'game_state': session.game_state,
+        })
+
+    elif t == 'clear_players':
+        session.players.clear()
+        session.game_state = 'lobby'
+        await broadcast({'type': 'players_update', 'players': [], 'game_state': 'lobby'})
+
 async def broadcast(event):
     dead = set()
     for ws in session.ui_clients:
@@ -720,6 +1208,13 @@ async def status_handler(request):
         'has_iv':        session.has_iv(),
         'iv':            session.iv.hex() if session.iv else None,
         'pkt_count':     session.seq,
+    })
+
+async def players_handler(request):
+    return web.json_response({
+        'players':    list(session.players.values()),
+        'game_state': session.game_state,
+        'count':      len(session.players),
     })
 
 # ─── Web UI (HTML + JS + CSS) ─────────────────────────────────────────────────
@@ -781,8 +1276,9 @@ tbody td{padding:3px 8px;border-bottom:1px solid #161b22;cursor:pointer;
   overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 tbody tr:hover td{background:var(--bg2)}
 tbody tr.sel td{background:#1c2333!important}
-.c-seq{width:46px}.c-ts{width:82px}.c-dir{width:46px}
-.c-sz{width:62px}.c-st{width:76px}.c-op{width:70px}.c-pay{width:auto}
+.c-seq{width:40px}.c-ts{width:72px}.c-dir{width:36px}
+.c-sz{width:52px}.c-st{width:66px}.c-op{width:56px}
+.c-nm{width:110px}.c-pay{width:auto}
 
 .dR{color:var(--green)}.dS{color:var(--blue)}
 .s-ok{color:var(--green)}.s-large{color:#7ee787}
@@ -791,20 +1287,143 @@ tbody tr.sel td{background:#1c2333!important}
 .s-truncated{color:#555e6a}
 
 /* Right panel */
-#right{width:350px;display:flex;flex-direction:column;border-left:1px solid var(--border);overflow:hidden;flex-shrink:0}
+#right{width:440px;display:flex;flex-direction:column;border-left:1px solid var(--border);overflow:hidden;flex-shrink:0}
 
-/* Detail */
-#detail{flex:1;overflow-y:auto;padding:10px 12px}
+/* Right-panel tab bar */
+#rtab-bar{display:flex;background:var(--bg2);border-bottom:1px solid var(--border);flex-shrink:0}
+.rtab{flex:1;text-align:center;padding:7px 4px;font-size:10px;text-transform:uppercase;
+  letter-spacing:1.5px;color:var(--gray);cursor:pointer;border-bottom:2px solid transparent;
+  transition:color .15s,border-color .15s}
+.rtab:hover{color:var(--text)}
+.rtab.on{color:var(--blue);border-bottom-color:var(--blue)}
+.rtab-content{display:flex;flex-direction:column;flex:1;overflow:hidden}
+
+/* Detail tab */
+#detail{flex:1;overflow-y:auto;padding:0}
 #detail-hd{background:var(--bg2);border-bottom:1px solid var(--border);
   padding:6px 12px;font-size:11px;color:var(--blue);flex-shrink:0}
-.df{margin-bottom:7px}.df .dk{color:var(--gray);font-size:9px;text-transform:uppercase;
-  letter-spacing:1.5px}.df .dv{margin-top:2px;word-break:break-all}
-.hdump{font-size:11px;line-height:1.65;color:#7ee787;background:var(--bg3);
-  padding:7px 8px;border-radius:4px;overflow-x:auto;white-space:pre;margin-top:3px;
-  max-height:180px;overflow-y:auto}
+
+/* Packet name hero */
+.pkt-hero{padding:10px 12px 6px;border-bottom:1px solid var(--border)}
+.pkt-hero-name{font-size:15px;font-weight:700;color:var(--text);letter-spacing:1px}
+.pkt-hero-name.unk{color:var(--gray)}
+.pkt-hero-desc{font-size:10px;color:var(--gray);margin-top:3px}
+.pkt-badges{display:flex;gap:5px;margin-top:6px;flex-wrap:wrap}
+.pb{font-size:10px;padding:1px 7px;border-radius:10px;border:1px solid;background:transparent}
+.pb-recv{color:var(--green);border-color:var(--green)44}
+.pb-send{color:var(--blue);border-color:var(--blue)44}
+.pb-both{color:var(--yellow);border-color:var(--yellow)44}
+.pb-unk{color:var(--gray);border-color:var(--border)}
+.pb-st-ok{color:var(--green);border-color:var(--green)44}
+.pb-st-large{color:#7ee787;border-color:#7ee78744}
+.pb-st-mismatch,.pb-st-encrypted{color:var(--gray);border-color:var(--border)}
+.pb-st-challenge{color:var(--yellow);border-color:var(--yellow)44}
+.pb-st-proto{color:#7dcfff;border-color:#7dcfff44}
+
+/* Meta row */
+.pkt-meta{padding:6px 12px;border-bottom:1px solid var(--border);display:flex;gap:12px;flex-wrap:wrap}
+.pm{font-size:10px;color:var(--gray)}.pm b{color:var(--text)}
+
+/* Decoded fields */
+.sec-hd{padding:5px 12px;font-size:9px;color:var(--gray);text-transform:uppercase;
+  letter-spacing:1.5px;background:var(--bg2);border-bottom:1px solid var(--border);
+  border-top:1px solid var(--border);margin-top:4px}
+.field-tbl{width:100%;border-collapse:collapse}
+.field-tbl td{padding:3px 12px;font-size:11px;vertical-align:top;
+  border-bottom:1px solid #1a1f27}
+.field-tbl .fk{color:var(--gray);width:38%;white-space:nowrap}
+.field-tbl .fv{color:var(--text);word-break:break-all}
+.fv.str{color:#79c0ff}.fv.hex{color:#7ee787;font-size:10px}
+.fv.u32,.fv.u16{color:#e3b341}.fv.float{color:#ffa657}
+.fv.status{color:var(--green)}
+
+/* Hex dump */
+.hdump-wrap{padding:6px 12px}
+.hdump{font-size:10.5px;line-height:1.7;background:var(--bg3);
+  border-radius:4px;overflow-x:auto;white-space:pre;padding:6px 8px;
+  max-height:200px;overflow-y:auto;border:1px solid var(--border)}
+.hdump .off{color:#444c56}.hdump .hx{color:#7ee787}.hdump .as{color:#8b949e}
+
 .copy-btn{font-size:10px;background:var(--bg3);border:1px solid var(--border);
-  color:var(--gray);padding:2px 8px;border-radius:3px;cursor:pointer;margin-top:6px}
+  color:var(--gray);padding:2px 8px;border-radius:3px;cursor:pointer;margin:4px 12px}
 .copy-btn:hover{color:var(--text)}
+
+/* Players tab */
+#tab-players{background:var(--bg)}
+#pl-hd{background:var(--bg2);border-bottom:1px solid var(--border);padding:6px 12px;
+  flex-shrink:0;display:flex;align-items:center;gap:8px}
+#pl-state{font-size:10px;padding:1px 8px;border-radius:10px;border:1px solid;
+  background:transparent;font-family:var(--mono)}
+#pl-state.lobby{color:var(--gray);border-color:var(--border)}
+#pl-state.room{color:var(--yellow);border-color:var(--yellow)55}
+#pl-state.ingame{color:var(--green);border-color:var(--green)55}
+#pl-cnt{font-size:10px;color:var(--gray);flex:1}
+#pl-refresh{font-size:10px;background:transparent;border:1px solid var(--border);
+  color:var(--gray);padding:1px 8px;border-radius:3px;cursor:pointer}
+#pl-refresh:hover{color:var(--text)}
+#pl-clear-btn{font-size:10px;background:transparent;border:1px solid var(--red)55;
+  color:var(--red);padding:1px 8px;border-radius:3px;cursor:pointer}
+#pl-clear-btn:hover{background:var(--red);color:#000}
+#pl-list{flex:1;overflow-y:auto;padding:6px 8px}
+#pl-empty{color:var(--gray);font-size:11px;text-align:center;padding:24px 0}
+
+.pl-team-hd{font-size:9px;text-transform:uppercase;letter-spacing:1.5px;
+  padding:4px 4px 2px;margin-top:6px;margin-bottom:2px}
+.pl-team-blue{color:#58a6ff}.pl-team-red{color:#f85149}.pl-team-none{color:var(--gray)}
+
+.pl-card{background:var(--bg2);border:1px solid var(--border);border-radius:5px;
+  margin-bottom:5px;overflow:hidden}
+.pl-card-top{display:flex;align-items:center;gap:7px;padding:6px 8px}
+.pl-alive-dot{width:8px;height:8px;border-radius:50%;flex-shrink:0}
+.pl-alive-dot.alive{background:var(--green);box-shadow:0 0 4px var(--green)}
+.pl-alive-dot.dead{background:#3a3f4a}
+.pl-name{font-size:12px;font-weight:700;color:var(--text);flex:1;
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.pl-rank{font-size:9px;color:#cba6f7;white-space:nowrap}
+.pl-id{font-size:9px;color:var(--gray)}
+.pl-kd{font-size:9px;color:var(--gray);white-space:nowrap}
+.pl-card-acts{display:flex;gap:4px;padding:0 8px 6px;flex-wrap:wrap}
+.act-btn{font-size:9px;padding:2px 8px;border-radius:3px;cursor:pointer;border:1px solid;
+  background:transparent;font-family:var(--mono);transition:background .12s}
+.act-kill{color:var(--red);border-color:var(--red)55}
+.act-kill:hover{background:var(--red);color:#000}
+.act-kick{color:var(--yellow);border-color:var(--yellow)55}
+.act-kick:hover{background:var(--yellow);color:#000}
+.act-edit{color:var(--blue);border-color:var(--blue)55}
+.act-edit:hover{background:var(--blue);color:#000}
+.act-log{font-size:9px;color:var(--gray);font-style:italic}
+
+/* Action log at bottom of players panel */
+#pl-actlog{background:var(--bg2);border-top:1px solid var(--border);
+  padding:5px 8px;flex-shrink:0;min-height:32px;max-height:70px;overflow-y:auto}
+.al-line{font-size:10px;padding:1px 0}
+.al-ok{color:var(--green)}.al-err{color:var(--red)}.al-info{color:var(--gray)}
+
+/* Edit modal */
+#pl-modal{display:none;position:fixed;inset:0;z-index:100;align-items:center;justify-content:center}
+#pl-modal.open{display:flex}
+#modal-bg{position:absolute;inset:0;background:#0009}
+#modal-box{position:relative;background:var(--bg2);border:1px solid var(--border);
+  border-radius:8px;width:360px;max-width:95vw;z-index:1;padding:0;overflow:hidden}
+#modal-hd{background:var(--bg3);padding:10px 14px;display:flex;align-items:center;gap:8px;
+  border-bottom:1px solid var(--border)}
+#modal-hd h2{font-size:12px;flex:1;color:var(--text)}
+#modal-close{background:transparent;border:none;color:var(--gray);cursor:pointer;font-size:16px;line-height:1}
+#modal-body{padding:12px 14px;display:flex;flex-direction:column;gap:10px}
+.mf{display:flex;flex-direction:column;gap:3px}
+.mf label{font-size:9px;color:var(--gray);text-transform:uppercase;letter-spacing:1px}
+.mf input,.mf select{background:var(--bg3);border:1px solid var(--border);color:var(--text);
+  padding:5px 8px;border-radius:4px;font-family:var(--mono);font-size:11px;width:100%}
+.mf-row{display:flex;gap:8px}
+.mf-row .mf{flex:1}
+#modal-ft{padding:10px 14px;display:flex;gap:8px;justify-content:flex-end;
+  border-top:1px solid var(--border);background:var(--bg3)}
+.modal-apply{background:var(--blue);border:none;color:#000;padding:4px 16px;
+  border-radius:4px;cursor:pointer;font-family:var(--mono);font-size:11px;font-weight:700}
+.modal-apply:hover{opacity:.85}
+.modal-cancel{background:transparent;border:1px solid var(--border);color:var(--gray);
+  padding:4px 10px;border-radius:4px;cursor:pointer;font-size:11px}
+#modal-st{font-size:10px;min-height:14px;padding:0 14px 6px;color:var(--gray)}
 
 /* Inject */
 #inj{background:var(--bg2);border-top:1px solid var(--border);padding:10px 12px;flex-shrink:0}
@@ -883,7 +1502,8 @@ tbody tr.sel td{background:#1c2333!important}
             <th class="c-sz">Boyut</th>
             <th class="c-st">Durum</th>
             <th class="c-op">Opcode</th>
-            <th class="c-pay">Payload</th>
+            <th class="c-nm">Paket</th>
+            <th class="c-pay">İçerik önizleme</th>
           </tr>
         </thead>
         <tbody id="tbody"></tbody>
@@ -891,11 +1511,33 @@ tbody tr.sel td{background:#1c2333!important}
     </div>
   </div>
 
-  <!-- Sağ: detay + inject -->
+  <!-- Sağ: detay + oyuncular + inject -->
   <div id="right">
-    <div id="detail-hd">Paket Detayı</div>
-    <div id="detail"><p style="color:var(--gray);font-size:11px;margin-top:8px">Bir satıra tıklayın…</p></div>
+    <!-- Tab bar -->
+    <div id="rtab-bar">
+      <div class="rtab on" data-tab="detail">📦 Detay</div>
+      <div class="rtab"    data-tab="players">👥 Oyuncular</div>
+    </div>
 
+    <!-- Detay tab -->
+    <div id="tab-detail" class="rtab-content">
+      <div id="detail-hd">Paket Detayı</div>
+      <div id="detail"><p style="color:var(--gray);font-size:11px;margin-top:8px">Bir satıra tıklayın…</p></div>
+    </div>
+
+    <!-- Oyuncular tab -->
+    <div id="tab-players" class="rtab-content" style="display:none">
+      <div id="pl-hd">
+        <span id="pl-state" class="lobby">lobby</span>
+        <span id="pl-cnt">0 oyuncu</span>
+        <button id="pl-refresh">↺ Yenile</button>
+        <button id="pl-clear-btn">🗑 Temizle</button>
+      </div>
+      <div id="pl-list"><div id="pl-empty">Henüz oyuncu gözlemlenmedi.<br>Oyuna girilince otomatik dolacak.</div></div>
+      <div id="pl-actlog"><span class="al-info">— Eylem günlüğü —</span></div>
+    </div>
+
+    <!-- Inject (her zaman altta) -->
     <div id="inj">
       <h3>▶ Paket Gönder (Inject)</h3>
       <div class="inj-tabs">
@@ -912,10 +1554,57 @@ tbody tr.sel td{background:#1c2333!important}
   </div>
 </div>
 
+<!-- Oyuncu düzenleme modal -->
+<div id="pl-modal">
+  <div id="modal-bg"></div>
+  <div id="modal-box">
+    <div id="modal-hd">
+      <h2 id="modal-title">Oyuncu Düzenle</h2>
+      <button id="modal-close">✕</button>
+    </div>
+    <div id="modal-body">
+      <div class="mf">
+        <label>📝 Yeni İsim</label>
+        <input id="m-name" type="text" maxlength="32" placeholder="Oyuncu adı (max 32 karakter)">
+      </div>
+      <div class="mf">
+        <label>⭐ Rütbe (0–16)</label>
+        <input id="m-rank" type="number" min="0" max="16" value="0" placeholder="0 = Acemi … 16 = Mareşal">
+      </div>
+      <div class="mf">
+        <label>🎒 Eşya Ver</label>
+        <div class="mf-row">
+          <div class="mf"><label>Item ID</label><input id="m-item" type="number" min="0" value="0" placeholder="Eşya ID"></div>
+          <div class="mf"><label>Adet</label><input id="m-qty" type="number" min="1" value="1"></div>
+          <div class="mf"><label>Gün (0=kalıcı)</label><input id="m-days" type="number" min="0" value="0"></div>
+        </div>
+      </div>
+      <div class="mf">
+        <label>📍 Işınlama Koordinatları</label>
+        <div class="mf-row">
+          <div class="mf"><label>X</label><input id="m-x" type="number" value="0" step="0.1"></div>
+          <div class="mf"><label>Y</label><input id="m-y" type="number" value="0" step="0.1"></div>
+          <div class="mf"><label>Z</label><input id="m-z" type="number" value="0" step="0.1"></div>
+        </div>
+      </div>
+    </div>
+    <div id="modal-st"></div>
+    <div id="modal-ft">
+      <button class="modal-cancel" id="modal-cancel-btn">İptal</button>
+      <button class="modal-apply" id="m-apply-name">İsim Uygula</button>
+      <button class="modal-apply" id="m-apply-rank">Rütbe Uygula</button>
+      <button class="modal-apply" id="m-apply-item">Eşya Ver</button>
+      <button class="modal-apply" id="m-apply-tp" style="background:#3fb950">Işınla</button>
+    </div>
+  </div>
+</div>
+
 <script>
 // ── WebSocket ────────────────────────────────────────────────────────────────
 const WS_URL = `${location.protocol.replace('http','ws')}//${location.host}/ui`;
 let ws, packets = [], selSeq = -1, autoScroll = true, injectMode = 'plain';
+// Player state
+let players = {}, gameState = 'lobby', modalPid = null;
 
 function connect() {
   ws = new WebSocket(WS_URL);
@@ -932,6 +1621,7 @@ function handle(m) {
     setDll(m.dll_status === 'connected');
     setKey(m.has_key, m.iv);
     renderAll();
+    if (m.players) setPlayers(m.players, m.game_state || 'lobby');
   }
   else if (m.type === 'packet') {
     packets.push(m.pkt);
@@ -944,7 +1634,6 @@ function handle(m) {
   else if (m.type === 'key_loaded') { setKey(true, m.iv); }
   else if (m.type === 'status') { showStatus(m.msg, m.level); }
   else if (m.type === 'redecrypted') {
-    // Retroaktif çözüm: tüm paket listesini güncelle ve tabloyu yenile
     packets = m.packets || [];
     renderAll();
     updCnt();
@@ -963,6 +1652,19 @@ function handle(m) {
     const el = document.getElementById('inj-st');
     el.textContent = `✗ ${m.msg}`;
     el.className = 'err';
+  }
+  else if (m.type === 'players_update') {
+    setPlayers(m.players || [], m.game_state || gameState);
+  }
+  else if (m.type === 'action_ok') {
+    addActLog(`✓ ${esc(m.action)} → ${esc(m.pname||'')} · ${esc(m.plain_hex||'')}`, 'ok');
+    document.getElementById('modal-st').textContent = m.msg || '✓ Eylem uygulandı';
+    document.getElementById('modal-st').style.color = 'var(--green)';
+  }
+  else if (m.type === 'action_error') {
+    addActLog(`✗ ${esc(m.msg||'')}`, 'err');
+    document.getElementById('modal-st').textContent = '✗ ' + (m.msg||'Hata');
+    document.getElementById('modal-st').style.color = 'var(--red)';
   }
 }
 
@@ -1027,14 +1729,27 @@ function mkRow(p) {
   const tr = document.createElement('tr');
   tr.dataset.seq = p.seq;
   if (p.seq === selSeq) tr.className = 'sel';
+  const nm = p.pkt_name || '';
+  const nmColor = nm.startsWith('UNK') || !nm ? 'var(--gray)' : '#cba6f7';
+  // preview: prefer decoded string fields (network-derived → must esc), else raw hex
+  let preview = '';
+  if (p.decoded && p.decoded.fields && p.decoded.fields.length > 0) {
+    const strFields = p.decoded.fields.filter(f => f.k === 'str' && f.v);
+    if (strFields.length > 0)
+      preview = esc(strFields.map(f => f.v).join(' · ').slice(0, 40));
+  }
+  if (!preview) preview = esc(p.payload_hex ? p.payload_hex.slice(0,32) : '');
+  // All interpolated values: seq/size are numbers; ts/status/opcode/nm are server tokens
+  // preview is already esc()'d above; nm comes from _OPCODES (trusted) but esc for depth
   tr.innerHTML = `
-    <td class="c-seq">${p.seq}</td>
-    <td class="c-ts">${p.ts}</td>
-    <td class="c-dir d${p.dir}">${p.dir==='R'?'←':'→'}</td>
-    <td class="c-sz">${p.size}B</td>
-    <td class="c-st s-${p.status}">${p.status}</td>
-    <td class="c-op">${p.opcode||'—'}</td>
-    <td class="c-pay" style="color:var(--gray);font-size:11px">${p.payload_hex?p.payload_hex.slice(0,36):''}</td>
+    <td class="c-seq">${+p.seq}</td>
+    <td class="c-ts">${esc(p.ts)}</td>
+    <td class="c-dir d${p.dir==='R'?'R':'S'}">${p.dir==='R'?'←':'→'}</td>
+    <td class="c-sz">${+p.size}B</td>
+    <td class="c-st s-${esc(p.status)}">${esc(p.status)}</td>
+    <td class="c-op">${esc(p.opcode||'—')}</td>
+    <td class="c-nm" style="color:${nmColor}">${esc(nm)}</td>
+    <td class="c-pay" style="color:var(--gray);font-size:10px">${preview}</td>
   `;
   tr.onclick = () => selectPkt(p.seq);
   return tr;
@@ -1088,6 +1803,14 @@ document.getElementById('btn-replay').addEventListener('click', () => {
   }).catch(e => { btn.disabled=false; btn.textContent='📂 Log Oynat'; showStatus('Log yüklenemedi: '+e,'error'); });
 });
 
+// ── HTML escaping (XSS prevention) ───────────────────────────────────────────
+// All packet-derived strings MUST pass through esc() before innerHTML insertion.
+const _ESC_MAP = {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'};
+function esc(s) {
+  if (s == null) return '';
+  return String(s).replace(/[&<>"']/g, c => _ESC_MAP[c]);
+}
+
 // ── Detail ───────────────────────────────────────────────────────────────────
 function selectPkt(seq) {
   selSeq = seq;
@@ -1097,46 +1820,120 @@ function selectPkt(seq) {
   if (p) showDetail(p);
 }
 
-function hexDump(h) {
-  if (!h) return '';
-  const bytes = h.match(/.{2}/g) || [];
+function hexDumpStr(hexStr) {
+  // hexStr comes from Python's bytes.hex() — only [0-9a-f] chars, no escaping needed
+  // ASCII column: escape HTML metacharacters (0x3c=<, 0x3e=>, 0x26=&, 0x22=", 0x27=')
+  if (!hexStr) return '';
+  const bytes = hexStr.match(/.{2}/g) || [];
   let out = '';
   for (let i = 0; i < bytes.length; i += 16) {
     const row = bytes.slice(i, i+16);
     const addr = i.toString(16).padStart(4,'0');
-    const hex  = row.map((b,j) => b+(j===7?' ':'')).join(' ');
-    const asc  = row.map(b => { const c = parseInt(b,16); return (c>=32&&c<127)?String.fromCharCode(c):'.'; }).join('');
-    out += `${addr}  ${hex.padEnd(49)}  ${asc}\n`;
+    const hex  = row.map((b,j) => b + (j===7?'  ':' ')).join('').trimEnd();
+    const asc  = row.map(b => {
+      const c = parseInt(b, 16);
+      if (c < 32 || c >= 127) return '.';
+      return esc(String.fromCharCode(c));   // escape <, >, &, ", '
+    }).join('');
+    out += `<span class="off">${addr}</span>  <span class="hx">${hex.padEnd(50)}</span>  <span class="as">${asc}</span>\n`;
   }
   return out.trimEnd();
 }
 
-function df(k, v) { return `<div class="df"><div class="dk">${k}</div><div class="dv">${v}</div></div>`; }
+function badgeCls(hint) {
+  if (hint==='S→C') return 'pb-recv';
+  if (hint==='C→S') return 'pb-send';
+  if (hint==='both') return 'pb-both';
+  return 'pb-unk';
+}
+
+// Validate that a string is pure lowercase hex (safe to embed in onclick attr)
+function isHexOnly(s) { return /^[0-9a-f]*$/.test(s||''); }
 
 function showDetail(p) {
   const d = document.getElementById('detail');
   let h = '';
-  const dir_lbl = p.dir==='R' ? '<span class="dR">← RECV (sunucu→istemci)</span>' : '<span class="dS">→ SEND (istemci→sunucu)</span>';
-  h += df('Sıra / Yön', `#${p.seq} &nbsp; ${dir_lbl}`);
-  h += df('Saat', p.ts);
-  h += df('Boyut', `${p.size} B`);
-  const st_cls = 's-'+(p.status||'');
-  h += df('Durum', `<span class="${st_cls}">${p.status}</span>${p.note?' — '+p.note:''}`);
-  if (p.opcode)     h += df('Opcode', `<b>${p.opcode}</b>`);
-  if (p.proto)      h += df('Proto', p.proto);
-  if (p.len_field != null) h += df('Len field', `${p.len_field} &nbsp; (beklenen: ${(p.size-3)&0xFF})`);
 
-  if (p.plain_hex) {
-    h += df('Plaintext', `<div class="hdump">${hexDump(p.plain_hex)}</div>`);
-    h += `<button class="copy-btn" onclick="fillInject('${p.plain_hex}')">↓ Inject kutusuna kopyala</button>`;
+  // ── Hero: packet name ────────────────────────────────────────────────────
+  const dec = p.decoded;
+  // name/desc/hint come from our own _OPCODES table (trusted), but escape anyway
+  const name = esc(dec ? dec.name : (p.pkt_name || (p.status==='challenge'?'CHALLENGE':'')));
+  const desc = esc(dec ? dec.desc : '');
+  const hint = dec ? dec.hint : '?';   // only literal values from _OPCODES: 'C→S','S→C','both','?'
+  const isUnk = name.startsWith('UNK') || !name;
+
+  h += `<div class="pkt-hero">`;
+  h += `<div class="pkt-hero-name${isUnk?' unk':''}">${name||'—'}</div>`;
+  if (desc) h += `<div class="pkt-hero-desc">${desc}</div>`;
+
+  // badges — status/opcode/dir are server-controlled safe tokens, esc for defence-in-depth
+  h += `<div class="pkt-badges">`;
+  if (p.dir==='R')       h += `<span class="pb pb-recv">← S→C</span>`;
+  else if (p.dir==='S')  h += `<span class="pb pb-send">→ C→S</span>`;
+  const hintCls = badgeCls(hint);
+  if (hint && hint!=='?') h += `<span class="pb ${hintCls}">${esc(hint)}</span>`;
+  h += `<span class="pb pb-st-${esc(p.status)}">${esc(p.status)}</span>`;
+  if (p.opcode) h += `<span class="pb pb-unk">${esc(p.opcode)}</span>`;
+  if (dec && dec.pay_len != null) h += `<span class="pb pb-unk">payload ${+dec.pay_len}B</span>`;
+  h += `</div></div>`;
+
+  // ── Meta ─────────────────────────────────────────────────────────────────
+  h += `<div class="pkt-meta">`;
+  h += `<span class="pm">#<b>${+p.seq}</b></span>`;
+  h += `<span class="pm">⏱ <b>${esc(p.ts)}</b></span>`;
+  h += `<span class="pm">📦 <b>${+p.size}B</b></span>`;
+  if (p.proto) h += `<span class="pm">proto <b>${esc(p.proto)}</b></span>`;
+  if (p.len_field != null) {
+    const exp = (p.size-3)&0xFF;
+    const match = p.len_field===exp ? '✓' : `≠${+exp}`;
+    h += `<span class="pm">len_field <b>${+p.len_field}</b> ${match}</span>`;
   }
-  h += df('Raw (şifreli)', `<div class="hdump">${hexDump(p.raw_hex)}</div>`);
+  if (p.note) h += `<span class="pm" style="color:var(--yellow)">${esc(p.note)}</span>`;
+  h += `</div>`;
+
+  // ── Decoded fields (UNTRUSTED — all values from network payload) ───────────
+  if (dec && dec.fields && dec.fields.length > 0) {
+    h += `<div class="sec-hd">Çözümlenen Alanlar</div>`;
+    h += `<table class="field-tbl">`;
+    for (const f of dec.fields) {
+      // f.n (field name) and f.v (field value) are both network-derived → must escape
+      const klass = /^[a-z0-9_-]+$/.test(f.k||'') ? f.k : 'val';   // whitelist CSS class
+      h += `<tr><td class="fk">${esc(f.n)}</td><td class="fv ${klass}">${esc(f.v)}</td></tr>`;
+    }
+    h += `</table>`;
+  }
+
+  // ── Plaintext hex dump ────────────────────────────────────────────────────
+  if (p.plain_hex && isHexOnly(p.plain_hex)) {
+    const byteCount = p.plain_hex.length / 2;
+    h += `<div class="sec-hd">Plaintext (${byteCount}B)</div>`;
+    h += `<div class="hdump-wrap"><div class="hdump">${hexDumpStr(p.plain_hex)}</div>`;
+    // onclick attrs: hex is validated pure-hex above — safe to embed directly
+    h += `<button class="copy-btn" onclick="fillInject('${p.plain_hex}')">↓ Inject kutusuna kopyala</button>`;
+    h += `<button class="copy-btn" onclick="copyHex('${p.plain_hex}')">📋 Kopyala</button></div>`;
+  }
+
+  // ── Raw (cipher) hex dump ─────────────────────────────────────────────────
+  if (p.raw_hex && isHexOnly(p.raw_hex)) {
+    const label = p.status === 'challenge' ? 'Challenge Ham Veri' : 'Raw / Şifreli';
+    h += `<div class="sec-hd">${label} (${p.raw_hex.length/2}B)</div>`;
+    h += `<div class="hdump-wrap"><div class="hdump">${hexDumpStr(p.raw_hex)}</div></div>`;
+  }
+
   d.innerHTML = h;
+  // Use textContent for the header — never innerHTML with packet data
+  document.getElementById('detail-hd').textContent =
+    (dec?.name || p.pkt_name) ? `Paket: ${dec?.name || p.pkt_name}` : 'Paket Detayı';
 }
 
 function fillInject(hex) {
   document.getElementById('inj-hex').value = (hex.match(/.{2}/g)||[]).join(' ');
   document.getElementById('inj-hex').focus();
+}
+
+function copyHex(hex) {
+  const txt = (hex.match(/.{2}/g)||[]).join(' ');
+  navigator.clipboard && navigator.clipboard.writeText(txt);
 }
 
 // ── Inject tabs ───────────────────────────────────────────────────────────────
@@ -1380,16 +2177,57 @@ async def log_upload_handler(request):
 
     return web.Response(text='ok')
 
+async def _dll_keepalive():
+    """DLL WebSocket bağlantılarını Replit proxy idle timeout'undan korumak için
+    her 20 saniyede bir uygulama seviyesinde keepalive frame gönderir.
+    WinHTTP heartbeat=None olduğu için bu yöntem kullanılır — WinHTTP BINARY
+    frame olarak alır, tip kontrolü geçemeyince yok sayar (zararsız)."""
+    # Keepalive marker: tip=0xFF (özel), veri=0 byte
+    KEEPALIVE = bytes([0xFF, 0x00, 0x00, 0x00, 0x00, 0x00])
+    while True:
+        await asyncio.sleep(20)
+        dead = set()
+        for ws in list(session.dll_clients):
+            if ws.closed:
+                dead.add(ws)
+                continue
+            try:
+                await ws.send_bytes(KEEPALIVE)
+            except Exception:
+                dead.add(ws)
+        if dead:
+            session.dll_clients -= dead
+            if session._dll_ws_latest in dead:
+                session._dll_ws_latest = None
+
+
+async def _start_keepalive(app):
+    app['_dll_keepalive'] = asyncio.ensure_future(_dll_keepalive())
+
+
+async def _stop_keepalive(app):
+    task = app.get('_dll_keepalive')
+    if task:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+
 def make_app():
     app = web.Application(client_max_size=32 * 1024 * 1024)  # 32 MB — büyük log dosyaları için
     app.router.add_get('/',              index_handler)
     app.router.add_get('/api/status',   status_handler)
+    app.router.add_get('/api/players',  players_handler)
     app.router.add_get('/api/packets',  packets_handler)
     app.router.add_get('/api/replay',   replay_handler)
     app.router.add_get('/dll',         dll_handler)
     app.router.add_get('/ui',          ui_handler)
     app.router.add_post('/log_upload',  log_upload_handler)
     app.router.add_get('/favicon.ico', lambda r: web.Response(status=204))
+    app.on_startup.append(_start_keepalive)
+    app.on_cleanup.append(_stop_keepalive)
     return app
 
 # ─── Main ────────────────────────────────────────────────────────────────────
