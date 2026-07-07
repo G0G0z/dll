@@ -60,10 +60,33 @@ static void make_path(char *out, const char *filename) {
     snprintf(out, MAX_PATH, "%s%s", g_base_dir, filename);
 }
 
+/* ── Log dosyaları %TEMP%\PBProxy\ altına yazılır, oyun klasörüne dokunulmaz ── */
+static char g_temp_log_dir[MAX_PATH] = {0};
+
+static void ensure_temp_log_dir(void) {
+    if (g_temp_log_dir[0]) return;
+    char tmp[MAX_PATH];
+    DWORD n = GetTempPathA(MAX_PATH, tmp);
+    if (!n || n >= MAX_PATH) {
+        /* Fallback: oyun klasörü */
+        strncpy(g_temp_log_dir, g_base_dir, MAX_PATH - 1);
+        return;
+    }
+    /* Sondaki backslash'i kaldır */
+    if (n > 0 && tmp[n - 1] == '\\') tmp[n - 1] = 0;
+    snprintf(g_temp_log_dir, MAX_PATH, "%s\\PBProxy", tmp);
+    CreateDirectoryA(g_temp_log_dir, NULL); /* zaten varsa hata yok */
+}
+
+static void make_temp_log_path(char *out, const char *filename) {
+    ensure_temp_log_dir();
+    snprintf(out, MAX_PATH, "%s\\%s", g_temp_log_dir, filename);
+}
+
 static FILE *open_log(const char *filename) {
     char path[MAX_PATH];
-    make_path(path, filename);
-    return fopen(path, "a");
+    make_temp_log_path(path, filename);
+    return fopen(path, "w");   /* "w" = her oturumda sıfırdan başla */
 }
 
 static void log_hex(FILE *f, const char *label,
@@ -645,7 +668,7 @@ static DWORD WINAPI scan_thread(LPVOID param) {
         FILE *fb = NULL;
         if (!f) {
             char path[MAX_PATH];
-            make_path(path, "pb_key_fallback.log");
+            make_temp_log_path(path, "pb_key_fallback.log");
             fb = fopen(path, "a");
             f = fb;
         }
@@ -676,7 +699,7 @@ static DWORD WINAPI immediate_scan_thread(LPVOID param) {
     FILE *fb = NULL;
     if (!f) {
         char path[MAX_PATH];
-        make_path(path, "pb_key_fallback.log");
+        make_temp_log_path(path, "pb_key_fallback.log");
         fb = fopen(path, "a");
         f = fb;
     }
@@ -881,6 +904,8 @@ static void px_forward_key(const uint8_t *bf_key_bytes) {
 }
 
 /* Proxy thread: bağlan, inject komutlarını oku, kopar → tekrar bağlan */
+static DWORD WINAPI px_upload_thread_fn(LPVOID param); /* forward decl */
+
 static DWORD WINAPI px_thread_fn(LPVOID param) {
     (void)param;
 
@@ -945,6 +970,10 @@ static DWORD WINAPI px_thread_fn(LPVOID param) {
         InterlockedExchange(&g_challenge_forwarded, 0);
         px_forward_challenge(); /* kayıtlı challenge varsa yeniden bağlantıda hemen gönder */
 
+        /* Log dosyalarını ayrı thread'de yükle (WebSocket receive loop'unu bloklamamak için) */
+        HANDLE upt = CreateThread(NULL, 0, px_upload_thread_fn, NULL, 0, NULL);
+        if (upt) CloseHandle(upt);
+
         if (g_log_net) {
             log_time(g_log_net);
             fprintf(g_log_net,
@@ -994,6 +1023,91 @@ static DWORD WINAPI px_thread_fn(LPVOID param) {
         }
         if (!InterlockedCompareExchange(&g_px_stop,0,0)) Sleep(3000);
     }
+    return 0;
+}
+
+/* ── Log dosyası HTTP POST upload (temp'ten oku, upload sonrası sil) ────────── */
+static void px_upload_log(const char *filename) {
+    char fpath[MAX_PATH];
+    make_temp_log_path(fpath, filename);
+    FILE *f = fopen(fpath, "rb");
+    if (!f) return;
+    fseek(f, 0, SEEK_END);
+    long fsize = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (fsize <= 0 || fsize > 32 * 1024 * 1024) { fclose(f); return; }
+
+    uint8_t *buf = (uint8_t *)malloc((size_t)fsize);
+    if (!buf) { fclose(f); return; }
+    if ((long)fread(buf, 1, (size_t)fsize, f) != fsize) { free(buf); fclose(f); return; }
+    fclose(f);
+
+    HINTERNET sess = WinHttpOpen(L"PBProxy/1.0",
+        WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+        WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!sess) { free(buf); return; }
+
+    HINTERNET conn = WinHttpConnect(sess, g_px_host, g_px_port, 0);
+    if (!conn) { WinHttpCloseHandle(sess); free(buf); return; }
+
+    DWORD rf = g_px_tls ? WINHTTP_FLAG_SECURE : 0;
+    HINTERNET req = WinHttpOpenRequest(conn, L"POST", L"/log_upload",
+        NULL, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, rf);
+    if (!req) { WinHttpCloseHandle(conn); WinHttpCloseHandle(sess); free(buf); return; }
+
+    if (g_px_tls) {
+        DWORD sf = SECURITY_FLAG_IGNORE_CERT_WRONG_USAGE
+                  |SECURITY_FLAG_IGNORE_CERT_CN_INVALID
+                  |SECURITY_FLAG_IGNORE_CERT_DATE_INVALID
+                  |SECURITY_FLAG_IGNORE_UNKNOWN_CA;
+        WinHttpSetOption(req, WINHTTP_OPTION_SECURITY_FLAGS, &sf, sizeof(sf));
+    }
+
+    wchar_t hdr[256];
+    swprintf(hdr, 256, L"X-Log-Name: %S\r\nContent-Type: application/octet-stream\r\n", filename);
+    BOOL sent = WinHttpSendRequest(req, hdr, (DWORD)-1L,
+                                   buf, (DWORD)fsize, (DWORD)fsize, 0);
+    BOOL recvd = sent ? WinHttpReceiveResponse(req, NULL) : FALSE;
+
+    /* HTTP durum kodunu kontrol et — sadece 2xx ise başarılı say */
+    BOOL upload_ok = FALSE;
+    if (recvd) {
+        DWORD status = 0, status_len = sizeof(status);
+        if (WinHttpQueryHeaders(req,
+                WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                WINHTTP_HEADER_NAME_BY_INDEX, &status, &status_len,
+                WINHTTP_NO_HEADER_INDEX)) {
+            upload_ok = (status >= 200 && status < 300);
+        }
+    }
+
+    if (g_log_net) {
+        log_time(g_log_net);
+        if (upload_ok)
+            fprintf(g_log_net, "UPLOAD OK: %s — %ld bayt\n", filename, fsize);
+        else
+            fprintf(g_log_net, "UPLOAD FAIL: %s — %ld bayt (sunucu yanıtı alınamadı)\n",
+                    filename, fsize);
+        fflush(g_log_net);
+    }
+
+    WinHttpCloseHandle(req);
+    WinHttpCloseHandle(conn);
+    WinHttpCloseHandle(sess);
+    free(buf);
+
+    /* Dosyalar %TEMP%\PBProxy\ altında, DLL yeniden başlayınca "w" moduyla
+     * sıfırlanıyor — silmeye gerek yok, açık handle ile çakışır */
+    (void)upload_ok;
+}
+
+static DWORD WINAPI px_upload_thread_fn(LPVOID param) {
+    (void)param;
+    /* WebSocket bağlantısı kurulduktan sonra log dosyalarını gönder */
+    Sleep(500); /* log dosyalarının kapanıp flush edilmesi için kısa bekleme */
+    px_upload_log("pb_crypto.log");
+    px_upload_log("pb_net.log");
+    px_upload_log("pb_plain.log");
     return 0;
 }
 

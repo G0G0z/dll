@@ -8,7 +8,7 @@ Tarayıcıdan özel paket gönderilebilir (inject).
 Kullanım:
   python proxy_server.py [--crypto pb_crypto.log] [--port 5000]
 """
-import asyncio, json, struct, re, time, argparse, glob
+import asyncio, json, struct, re, time, argparse, glob, os
 from aiohttp import web
 import aiohttp
 
@@ -50,7 +50,7 @@ def cfb64_enc(P, S, plain, iv_bytes):
     cipher, _, _ = _cfb64(P, S, plain, iv_bytes, encrypt=True)
     return cipher
 
-# ─── Anahtar yükleme ─────────────────────────────────────────────────────────
+# ─── Anahtar + IV yükleme ────────────────────────────────────────────────────
 
 CONFIRMED_SIG = (0xc87bf7d2, 0x64215ab6, 0x4108fddb, 0x5e2ee03f)
 
@@ -83,30 +83,121 @@ def load_key(crypto_log, target_sig=CONFIRMED_SIG):
         pass
     return None, None
 
+# pb_net.log'daki her TCP/UDP satırını eşler
+def load_key_any(crypto_log):
+    """pb_crypto.log'dan son geçerli BF_KEY adayını yükle — SIG filtresi yok.
+    DLL her oturumda farklı bir anahtar üretir; CONFIRMED_SIG sadece belirli
+    bir oturuma aittir. Otomatik yükleme için son tam aday kullanılır."""
+    cur_p, cur_s = None, []
+    last_p, last_s = None, None
+    try:
+        with open(crypto_log, encoding='utf-8', errors='replace') as f:
+            for line in f:
+                s = line.strip()
+                if 'BF_KEY ADAYI' in s:
+                    if cur_p and len(cur_s) == 4:
+                        last_p, last_s = cur_p, list(cur_s)
+                    cur_p, cur_s = None, []
+                    continue
+                m = re.search(r'\[72 bytes\]:\s*([0-9a-fA-F]{144})', s)
+                if m:
+                    cur_p = list(struct.unpack('<18I', bytes.fromhex(m.group(1))))
+                    continue
+                m = re.search(r'S\[\d\] \(1024B\).*?\[1024 bytes\]:\s*([0-9a-fA-F]{2048})', s)
+                if m:
+                    cur_s.append(list(struct.unpack('<256I', bytes.fromhex(m.group(1)))))
+                    continue
+    except OSError:
+        pass
+    if cur_p and len(cur_s) == 4:
+        last_p, last_s = cur_p, list(cur_s)
+    return last_p, last_s
+
+_NET_PKT_RE = re.compile(
+    r'TCP\s+(RECV|SEND)\s+[←→].*?\[(\d+)\s+bytes\]:\s*([0-9a-fA-F]+)',
+    re.IGNORECASE
+)
+
+def load_iv_from_net_log(path):
+    """pb_net.log'dan IV çıkar: 0xc5 ile başlayan ilk RECV paketi challenge[3:11]"""
+    try:
+        with open(path, encoding='utf-8', errors='replace') as f:
+            for line in f:
+                m = _NET_PKT_RE.search(line)
+                if not m:
+                    continue
+                if m.group(1).upper() != 'RECV':
+                    continue
+                try:
+                    raw = bytes.fromhex(m.group(3))
+                except ValueError:
+                    continue
+                if len(raw) >= 11 and raw[0] == 0xc5:
+                    return bytes(raw[3:11])
+    except OSError:
+        pass
+    return None
+
+def auto_load_session(crypto_path=None, net_path=None, sig=CONFIRMED_SIG):
+    """Mevcut log dosyalarından anahtar ve IV'i sessizce yükle. Değişen alanları döndür."""
+    changed = {}
+    if crypto_path:
+        P, S = load_key(crypto_path, sig)
+        if P and S:
+            session.set_key(P, S)
+            changed['key'] = crypto_path
+    if net_path:
+        iv = load_iv_from_net_log(net_path)
+        if iv:
+            session.set_iv(iv)
+            changed['iv'] = iv.hex()
+    return changed
+
 # ─── Oturum durumu ────────────────────────────────────────────────────────────
 
 class Session:
     def __init__(self):
         self.P   = None         # Blowfish P-array
         self.S   = None         # Blowfish S-boxes
-        self.iv  = None         # bytes[8] — challenge[3:11]
-        self.dll_ws    = None   # DLL WebSocket bağlantısı
-        self.ui_clients = set() # Tarayıcı WebSocket bağlantıları
-        self.packets   = []     # Son 500 paket
-        self.seq       = 0      # Paket sıra numarası
+        self.iv  = None         # bytes[8] — challenge[3:11] (başlangıç IV)
+        # CFB-64 STREAMING durumu — RECV ve SEND bağımsız akışlardır
+        self.iv_recv = None     # RECV akışının mevcut CFB IV'i
+        self.n_recv  = 0        # RECV akışının blok içi ofseti (0-7)
+        self.iv_send = None     # SEND akışının mevcut CFB IV'i
+        self.n_send  = 0        # SEND akışının blok içi ofseti (0-7)
+        self.dll_ws    = None
+        self.ui_clients = set()
+        self.packets   = []
+        self.seq       = 0
 
     def has_key(self): return self.P is not None
     def has_iv(self):  return self.iv is not None
 
+    def _reset_streams(self):
+        """IV veya anahtar değiştiğinde her iki yönün CFB durumunu başa al."""
+        if self.iv:
+            self.iv_recv, self.n_recv = self.iv, 0
+            self.iv_send, self.n_send = self.iv, 0
+
+    def set_iv(self, iv_bytes):
+        """IV'i dışarıdan ata (log yükleme, startup) ve akışları sıfırla."""
+        self.iv = iv_bytes
+        self._reset_streams()
+
+    def set_key(self, P, S):
+        """Anahtarı ata ve IV mevcutsa akışları sıfırla."""
+        self.P, self.S = P, S
+        self._reset_streams()
+
     def try_challenge(self, raw):
-        """202-byte challenge → IV çıkar."""
+        """202-byte challenge → IV çıkar, CFB akışlarını sıfırla."""
         if len(raw) >= 11 and raw[0] == 0xc5:
-            self.iv = bytes(raw[3:11])
+            self.set_iv(bytes(raw[3:11]))
             return True
         return False
 
     def score_iv(self, candidate_iv: bytes, n_pkts: int = 8) -> int:
-        """IV adayının mevcut paketlere göre skor hesapla (proto=0x0D eşleşmesi)."""
+        """IV adayının mevcut paketlere göre skor hesapla (stateless, sadece ilk paket)."""
         if not self.P:
             return 0
         test = [ev for ev in self.packets[-30:]
@@ -114,28 +205,45 @@ class Session:
         score = 0
         for ev in test:
             raw = bytes.fromhex(ev['raw_hex'])
-            p = cfb64_dec(self.P, self.S, raw, candidate_iv)
+            p, _, _ = _cfb64(self.P, self.S, raw, candidate_iv, encrypt=False)
             if p and len(p) > 1 and p[1] == 0x0D:
                 score += 1
         return score
 
     def apply_iv_if_better(self, candidate_iv: bytes) -> bool:
-        """Mevcut IV'den daha iyi ya da eşit skor veriyorsa uygula."""
         new_score = self.score_iv(candidate_iv)
         old_score = self.score_iv(self.iv) if self.iv else -1
         if new_score >= old_score:
-            self.iv = candidate_iv
+            self.set_iv(candidate_iv)
             return True
         print(f'[IV] Reddedildi {candidate_iv.hex()} (skor {new_score}) < mevcut {self.iv.hex()} (skor {old_score})')
         return False
 
-    def decrypt(self, cipher):
-        if not self.has_key() or not self.has_iv(): return None
-        return cfb64_dec(self.P, self.S, cipher, self.iv)
+    def decrypt(self, cipher, direction='R'):
+        """Stateful CFB-64 decrypt — yön başına bağımsız akış durumu korunur."""
+        if not self.has_key() or not self.has_iv():
+            return None
+        if direction == 'R':
+            if self.iv_recv is None:
+                self.iv_recv, self.n_recv = self.iv, 0
+            plain, self.iv_recv, self.n_recv = _cfb64(
+                self.P, self.S, cipher, self.iv_recv, encrypt=False, n_in=self.n_recv)
+        else:
+            if self.iv_send is None:
+                self.iv_send, self.n_send = self.iv, 0
+            plain, self.iv_send, self.n_send = _cfb64(
+                self.P, self.S, cipher, self.iv_send, encrypt=False, n_in=self.n_send)
+        return plain
 
     def encrypt(self, plain):
-        if not self.has_key() or not self.has_iv(): return None
-        return cfb64_enc(self.P, self.S, plain, self.iv)
+        """Stateful CFB-64 encrypt — SEND akışı durumu korunur."""
+        if not self.has_key() or not self.has_iv():
+            return None
+        if self.iv_send is None:
+            self.iv_send, self.n_send = self.iv, 0
+        cipher, self.iv_send, self.n_send = _cfb64(
+            self.P, self.S, plain, self.iv_send, encrypt=True, n_in=self.n_send)
+        return cipher
 
 session = Session()
 
@@ -179,8 +287,25 @@ def fmt_packet(seq, direction, raw, plain, ts=None):
 
 # ─── WebSocket: DLL bağlantısı (/dll) ────────────────────────────────────────
 
+def _clear_log_data():
+    """Eski oturumun log dosyalarını sil — yeni oturum taze başlasın."""
+    log_dir = 'log_data'
+    if not os.path.isdir(log_dir):
+        return
+    deleted = []
+    for fname in os.listdir(log_dir):
+        if fname.endswith('.log'):
+            try:
+                os.remove(os.path.join(log_dir, fname))
+                deleted.append(fname)
+            except OSError:
+                pass
+    if deleted:
+        print(f'[SESSION] Eski log dosyaları silindi: {", ".join(deleted)}')
+
 async def dll_handler(request):
-    ws = web.WebSocketResponse(max_msg_size=8 * 1024 * 1024)
+    # heartbeat=30 → her 30s ping gönderir, Replit proxy idle timeout'u önler
+    ws = web.WebSocketResponse(max_msg_size=8 * 1024 * 1024, heartbeat=30.0)
     await ws.prepare(request)
 
     peer = request.remote or '?'
@@ -190,6 +315,9 @@ async def dll_handler(request):
         await session.dll_ws.close()
     session.dll_ws = ws
 
+    # NOT: Oturum state'i burada sıfırlanmıyor.
+    # Yeniden bağlantı (kopup tekrar bağlanma) normal — state korunmalı.
+    # Gerçek yeni oyun oturumu challenge frame'iyle tespit edilir.
     await broadcast({'type': 'dll_connected', 'peer': peer})
 
     try:
@@ -199,7 +327,6 @@ async def dll_handler(request):
             elif msg.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.ERROR):
                 break
     finally:
-        # Sadece BU bağlantı hâlâ aktifse sıfırla; yeni bağlantı geçtiyse dokunma
         if session.dll_ws is ws:
             session.dll_ws = None
             print(f'[DLL] Bağlantı kesildi: {peer}')
@@ -218,7 +345,7 @@ async def _handle_key_frame(raw: bytes):
         return
     P = list(struct.unpack_from('<18I', raw, 0))
     S = [list(struct.unpack_from('<256I', raw, (18 + i * 256) * 4)) for i in range(4)]
-    session.P, session.S = P, S
+    session.set_key(P, S)
     sig = (S[0][0], S[1][0], S[2][0], S[3][0])
     confirmed = '✓ ONAYLANDI' if sig == CONFIRMED_SIG else '(doğrulanmadı)'
     sig_str   = ' '.join(f'{x:08x}' for x in sig)
@@ -229,35 +356,55 @@ async def _handle_key_frame(raw: bytes):
     await _redecrypt_session()  # önceden encrypted gelen paketleri yeniden çöz
 
 async def _redecrypt_session():
-    """Anahtar + IV mevcut olduğunda 'encrypted' paketleri retroaktif çöz."""
+    """Tüm paketi baştan stateful oynat: RECV ve SEND CFB akışlarını sıfırlayıp
+    sırayla decrypt uygular. 'encrypted' / 'mismatch' paketleri günceller.
+    Doğru akış durumu için challenge olmayan TÜM paketler işlenir."""
     if not session.has_key() or not session.has_iv():
         return
+    # Her yön için bağımsız başlangıç durumu
+    iv_r, n_r = session.iv, 0
+    iv_s, n_s = session.iv, 0
     changed = 0
     for ev in session.packets:
-        if ev.get('status') != 'encrypted':
+        status = ev.get('status')
+        if status == 'challenge':
+            # Yeni challenge → IV güncelle, akışları sıfırla
+            raw_ch = bytes.fromhex(ev.get('raw_hex', ''))
+            if len(raw_ch) >= 11 and raw_ch[0] == 0xc5:
+                new_iv = bytes(raw_ch[3:11])
+                iv_r, n_r = new_iv, 0
+                iv_s, n_s = new_iv, 0
             continue
         raw = bytes.fromhex(ev.get('raw_hex', ''))
         if not raw:
             continue
-        plain = cfb64_dec(session.P, session.S, raw, session.iv)
-        if plain is None:
-            continue
-        ev['plain_hex']   = plain.hex()
-        ev['len_field']   = plain[0] if plain else None
-        ev['proto']       = plain[1] if len(plain) > 1 else None
-        ev['opcode']      = plain[2] if len(plain) > 2 else None
-        ev['payload_hex'] = plain[3:67].hex() if len(plain) > 3 else ''
-        expected  = (ev['size'] - 3) & 0xFF
-        len_ok    = (ev['len_field'] == expected and ev['size'] <= 258)
-        proto_ok  = (ev['proto'] == 0x0D)
-        if len_ok and proto_ok:        ev['status'] = 'ok'
-        elif proto_ok and not len_ok:  ev['status'] = 'large'
-        elif len_ok and not proto_ok:  ev['status'] = 'proto?'
-        else:                          ev['status'] = 'mismatch'
-        if ev['opcode'] is not None:   ev['opcode'] = f"0x{ev['opcode']:02x}"
-        if ev['proto']  is not None:   ev['proto']  = f"0x{ev['proto']:02x}"
-        ev['note'] = 'retroaktif çözüldü'
-        changed += 1
+        direction = ev.get('dir', 'R')
+        if direction == 'R':
+            plain, iv_r, n_r = _cfb64(session.P, session.S, raw, iv_r, encrypt=False, n_in=n_r)
+        else:
+            plain, iv_s, n_s = _cfb64(session.P, session.S, raw, iv_s, encrypt=False, n_in=n_s)
+        # Sadece henüz çözülemeyen paketleri güncelle
+        if status in ('encrypted', 'mismatch', 'proto?'):
+            ev['plain_hex']   = plain.hex()
+            ev['len_field']   = plain[0] if plain else None
+            ev['proto']       = plain[1] if len(plain) > 1 else None
+            ev['opcode']      = plain[2] if len(plain) > 2 else None
+            ev['payload_hex'] = plain[3:67].hex() if len(plain) > 3 else ''
+            expected  = (ev['size'] - 3) & 0xFF
+            len_ok    = (ev['len_field'] == expected and ev['size'] <= 258)
+            proto_ok  = (ev['proto'] == 0x0D)
+            if len_ok and proto_ok:        ev['status'] = 'ok'
+            elif proto_ok and not len_ok:  ev['status'] = 'large'
+            elif len_ok and not proto_ok:  ev['status'] = 'proto?'
+            else:                          ev['status'] = 'mismatch'
+            if ev['opcode'] is not None:   ev['opcode'] = f"0x{ev['opcode']:02x}"
+            if ev['proto']  is not None:   ev['proto']  = f"0x{ev['proto']:02x}"
+            ev['note'] = 'retroaktif çözüldü'
+            if ev['status'] != status:
+                changed += 1
+    # Canlı stream durumunu güncelle — sonraki paketler doğru noktadan devam eder
+    session.iv_recv, session.n_recv = iv_r, n_r
+    session.iv_send, session.n_send = iv_s, n_s
     if changed:
         print(f'[REDECRYPT] {changed} paket güncellendi')
         await broadcast({'type': 'redecrypted', 'packets': session.packets[-500:]})
@@ -282,11 +429,21 @@ async def on_dll_frame(data: bytes):
         return
 
     # CHALLENGE frame: DLL kayıtlı challenge'ı bağlantıda otomatik gönderir
-    # Her yeni session'da IV güncellenmeli → has_iv() kontrolü yok
     if pkt_type == 0x43:
         raw = data[6: 6 + data_len]
         if len(raw) >= 11 and raw[0] == 0xc5:
+            new_iv = bytes(raw[3:11])
+            is_new_session = (session.iv != new_iv)  # IV değiştiyse → yeni oyun oturumu
             session.try_challenge(raw)
+
+            if is_new_session:
+                # Yeni oyun oturumu: eski paketler ve log_data temizle
+                print(f'[SESSION] Yeni oyun oturumu tespit edildi (IV değişti) — temizleniyor')
+                _clear_log_data()
+                session.packets.clear()
+                session.seq = 0
+                await broadcast({'type': 'cleared'})
+
             lvl = 'ok' if session.has_key() else 'warn'
             msg = (f'Challenge (DLL geçmişi) — IV={session.iv.hex()}' if session.has_key()
                    else f'Challenge (DLL geçmişi) — IV={session.iv.hex()} — anahtar bekleniyor')
@@ -314,7 +471,7 @@ async def on_dll_frame(data: bytes):
         await _redecrypt_session()  # anahtar varsa mevcut encrypted paketleri çöz
         return
 
-    plain = session.decrypt(raw)
+    plain = session.decrypt(raw, direction)
     ev    = fmt_packet(session.seq, direction, raw, plain, ts)
     session.seq += 1
     _store(ev)
@@ -415,7 +572,7 @@ async def on_ui_cmd(ws, cmd):
         path = cmd.get('path', 'log_data/pb_crypto.log')
         P, S = load_key(path)
         if P and S:
-            session.P, session.S = P, S
+            session.set_key(P, S)
             await ws.send_json({'type': 'status', 'msg': f'Anahtar yüklendi: {path}', 'level': 'ok'})
         else:
             await ws.send_json({'type': 'status', 'msg': f'Anahtar bulunamadı: {path}', 'level': 'error'})
@@ -926,23 +1083,34 @@ async def replay_handler(request):
     # Sıfırla
     session.packets.clear()
     session.seq = 0
-    replay_iv = session.iv  # mevcut IV varsa kullan
+
+    # Replay için yön başına bağımsız CFB akış durumu
+    rp_iv_r = rp_iv_s = session.iv  # mevcut IV'den başla (challenge bulunana kadar)
+    rp_n_r  = rp_n_s  = 0
 
     evs = []
     for p in pkts:
         raw, direction, ts, size = p['raw'], p['dir'], p['ts'], p['size']
 
-        # Challenge tespiti
+        # Challenge tespiti — yeni IV + akışları sıfırla
         if direction == 'R' and size == 202 and len(raw) >= 11 and raw[0] == 0xc5:
-            replay_iv   = bytes(raw[3:11])
-            session.iv  = replay_iv
+            new_iv = bytes(raw[3:11])
+            rp_iv_r = rp_iv_s = new_iv
+            rp_n_r  = rp_n_s  = 0
+            session.set_iv(new_iv)     # session IV'ini de set_iv() ile güncelle
             ev = fmt_packet(session.seq, 'R', raw, None, ts)
             ev['status'] = 'challenge'
-            ev['note']   = f'IV={replay_iv.hex()} (log)'
+            ev['note']   = f'IV={new_iv.hex()} (log)'
         else:
             plain = None
-            if session.P and session.S and replay_iv and p['full']:
-                plain = cfb64_dec(session.P, session.S, raw, replay_iv)
+            if session.P and session.S and rp_iv_r and p['full']:
+                # Stateful CFB: yön başına akış durumu korunur
+                if direction == 'R':
+                    plain, rp_iv_r, rp_n_r = _cfb64(
+                        session.P, session.S, raw, rp_iv_r, encrypt=False, n_in=rp_n_r)
+                else:
+                    plain, rp_iv_s, rp_n_s = _cfb64(
+                        session.P, session.S, raw, rp_iv_s, encrypt=False, n_in=rp_n_s)
             ev = fmt_packet(session.seq, direction, raw, plain, ts)
             if not p['full'] and ev['status'] not in ('ok', 'large', 'challenge'):
                 ev['status'] = 'truncated'
@@ -950,6 +1118,10 @@ async def replay_handler(request):
         session.seq += 1
         _store(ev)
         evs.append(ev)
+
+    # Replay bitti — canlı akış durumunu sync et
+    session.iv_recv, session.n_recv = rp_iv_r, rp_n_r
+    session.iv_send, session.n_send = rp_iv_s, rp_n_s
 
     # Tüm istemcilere gönder
     await broadcast({'type': 'cleared'})
@@ -975,14 +1147,65 @@ async def packets_handler(request):
         })
     return web.json_response({'iv': session.iv.hex() if session.iv else None, 'packets': pkts})
 
+async def log_upload_handler(request):
+    """DLL'den gelen log dosyası yüklemesi: POST /log_upload
+    Dosya kaydedildikten sonra anahtar/IV otomatik güncellenir ve
+    'encrypted' durumdaki paketler retroaktif olarak çözülür.
+    """
+    name = request.headers.get('X-Log-Name', '')
+    name = os.path.basename(name)                       # path traversal engelle
+    if not name or not name.endswith('.log'):
+        return web.Response(status=400, text='bad filename')
+    data = await request.read()
+    if not data:
+        return web.Response(status=400, text='empty body')
+    os.makedirs('log_data', exist_ok=True)
+    path = os.path.join('log_data', name)
+    with open(path, 'wb') as f:
+        f.write(data)
+    print(f'[LOG] ✓ {name} yüklendi — {len(data)} bayt → {path}')
+    await broadcast({'type': 'log_uploaded', 'name': name,
+                     'size': len(data), 'path': path})
+
+    # ── Otomatik anahtar / IV güncelleme ──────────────────────────────────
+    if name == 'pb_crypto.log':
+        # load_key_any: SIG filtresi olmadan son tam BF_KEY adayını yükle
+        P, S = load_key_any(path)
+        if P and S:
+            session.set_key(P, S)
+            sig = (S[0][0], S[1][0], S[2][0], S[3][0])
+            sig_str = ' '.join(f'{x:08x}' for x in sig)
+            confirmed = '✓ ONAYLANDI' if sig == CONFIRMED_SIG else '(doğrulanmadı)'
+            msg = f'[AUTO] Anahtar güncellendi {confirmed} — SIG={sig_str}'
+            print(msg)
+            await broadcast({'type': 'key_loaded',
+                             'iv': session.iv.hex() if session.iv else None})
+            await broadcast({'type': 'status', 'msg': msg, 'level': 'ok'})
+            await _redecrypt_session()
+
+    elif name == 'pb_net.log':
+        iv = load_iv_from_net_log(path)
+        if iv:
+            session.set_iv(iv)
+            msg = f'[AUTO] IV güncellendi — {iv.hex()}'
+            print(msg)
+            await broadcast({'type': 'key_loaded', 'iv': iv.hex()})
+            await broadcast({'type': 'status', 'msg': msg, 'level': 'ok'})
+            await _redecrypt_session()
+        else:
+            print('[AUTO] pb_net.log yüklendi — challenge paketi bulunamadı, IV bekleniyor.')
+
+    return web.Response(text='ok')
+
 def make_app():
-    app = web.Application()
+    app = web.Application(client_max_size=32 * 1024 * 1024)  # 32 MB — büyük log dosyaları için
     app.router.add_get('/',              index_handler)
     app.router.add_get('/api/status',   status_handler)
     app.router.add_get('/api/packets',  packets_handler)
     app.router.add_get('/api/replay',   replay_handler)
     app.router.add_get('/dll',         dll_handler)
     app.router.add_get('/ui',          ui_handler)
+    app.router.add_post('/log_upload',  log_upload_handler)
     app.router.add_get('/favicon.ico', lambda r: web.Response(status=204))
     return app
 
@@ -998,24 +1221,38 @@ def main():
 
     target_sig = tuple(int(x, 16) for x in args.sig.split())
 
-    # Anahtar yükleme sırası
-    candidates = [
+    # ── Anahtar yükleme sırası (en güncel log_data/ öncelikli) ───────────────
+    key_candidates = [
         args.crypto,
         'log_data/pb_crypto.log',
         'pb_crypto.log',
     ] + sorted(glob.glob('attached_assets/pb_crypto_*.log'), reverse=True)
 
-    for path in candidates:
+    for path in key_candidates:
         if not path:
             continue
         P, S = load_key(path, target_sig)
         if P and S:
-            session.P, session.S = P, S
+            session.set_key(P, S)
             print(f'[KEY] ✓ Anahtar yüklendi: {path}')
             print(f'[KEY]   SIG={" ".join(f"{x:08x}" for x in target_sig)}')
             break
     else:
-        print('[KEY] ✗ Anahtar bulunamadı — tarayıcıdan yüklenebilir.')
+        print('[KEY] ✗ Anahtar bulunamadı — DLL bağlandığında otomatik yüklenecek.')
+
+    # ── IV yükleme sırası (pb_net.log'dan challenge[3:11]) ────────────────
+    iv_candidates = [
+        'log_data/pb_net.log',
+        'pb_net.log',
+    ]
+    for path in iv_candidates:
+        iv = load_iv_from_net_log(path)
+        if iv:
+            session.set_iv(iv)
+            print(f'[IV]  ✓ IV yüklendi: {path} — {iv.hex()}')
+            break
+    else:
+        print('[IV]  ✗ IV bulunamadı — DLL challenge paketi gönderince otomatik set edilecek.')
 
     app = make_app()
 
