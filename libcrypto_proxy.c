@@ -735,6 +735,15 @@ static uint8_t       g_saved_challenge[CHALLENGE_SIZE];
 static volatile LONG g_saved_challenge_len = 0;
 static volatile LONG g_challenge_forwarded  = 0;
 
+/* ── Kayıtlı BF_KEY — bağlantı kurulunca hemen yeniden gönderilir ── */
+static uint8_t       g_saved_key[BF_KEY_SIZE]; /* BF_KEY_SIZE = 4168 byte */
+static volatile LONG g_saved_key_valid = 0;
+
+/* ── Key-ready event — px_thread_fn bu eventi bekleyip SONRA bağlanır ──
+ * Oyun login/sunucu-seçim ekranı geçildikten sonra WS bağlantısı yapılır;
+ * bu sayede WinHTTP handshake kritik oyun aşamasıyla çakışmaz.           */
+static HANDLE        g_px_key_event   = NULL;
+
 /* ── Config ── */
 static wchar_t       g_px_host[512]  = {0};
 static INTERNET_PORT g_px_port       = INTERNET_DEFAULT_HTTPS_PORT;
@@ -749,6 +758,17 @@ static HINTERNET     g_px_ws         = NULL;
 static CRITICAL_SECTION g_px_cs;
 static BOOL          g_px_cs_ok      = FALSE;
 static HANDLE        g_px_thread     = NULL;
+
+/* ── Send Queue (hook thread'leri WinHTTP'ye dokunmaz; sadece enqueue yapar) ──
+ * px_send_thread_fn tek başına WinHttpWebSocketSend çağırır → race yok.     */
+#define PXQ_SLOTS  256
+typedef struct { uint8_t *data; DWORD len; } PxQItem;
+static PxQItem          g_pxq[PXQ_SLOTS];
+static volatile LONG    g_pxq_w       = 0;   /* üretici yazar  */
+static volatile LONG    g_pxq_r       = 0;   /* tüketici okur  */
+static HANDLE           g_pxq_sem     = NULL; /* sayaçlı semafor */
+static CRITICAL_SECTION g_pxq_cs;
+static BOOL             g_pxq_cs_ok   = FALSE;
 
 /* ── Oyun soketi halkası (inject için) ── */
 #define PX_MAX_GS  4
@@ -826,81 +846,119 @@ static SOCKET px_gsock(void) {
 }
 
 /* Paketi Python proxy'ye ilet (thread-safe) */
-static void px_forward(uint8_t dir, const uint8_t *data, int len) {
-    if (!g_px_cs_ok || !data || len<=0) return;
-    if (!InterlockedCompareExchange(&g_px_ready,0,0)) return;
+/* ── Send queue yardımcıları ── */
 
-    EnterCriticalSection(&g_px_cs);
-    HINTERNET ws = g_px_ws;
-    if (ws) {
-        uint8_t *buf = (uint8_t*)malloc(PX_HDR + len);
-        if (buf) {
-            uint32_t u32 = (uint32_t)len;
-            buf[0] = PX_TYPE_PKT;
-            buf[1] = dir;
-            memcpy(buf+2, &u32, 4);
-            memcpy(buf+6, data, len);
-            WinHttpWebSocketSend(ws,
-                WINHTTP_WEB_SOCKET_BINARY_MESSAGE_BUFFER_TYPE,
-                buf, (DWORD)(PX_HDR+len));
-            free(buf);
-        }
+/* buf sahipliğini kuyruğa devreder; kuyruk doluysa serbest bırakır. */
+static void px_enqueue(uint8_t *buf, DWORD len) {
+    if (!g_pxq_cs_ok || !g_pxq_sem || !buf) { free(buf); return; }
+    EnterCriticalSection(&g_pxq_cs);
+    LONG w    = g_pxq_w;
+    LONG next = (w + 1) % PXQ_SLOTS;
+    if (next == g_pxq_r) {
+        /* Kuyruk dolu — yeni frame'i düşür */
+        LeaveCriticalSection(&g_pxq_cs);
+        free(buf);
+        return;
     }
-    LeaveCriticalSection(&g_px_cs);
+    g_pxq[w].data = buf;
+    g_pxq[w].len  = len;
+    g_pxq_w = next;
+    LeaveCriticalSection(&g_pxq_cs);
+    ReleaseSemaphore(g_pxq_sem, 1, NULL);
 }
 
-/* Kayıtlı challenge paketini Python proxy'ye ilet (0x43 'C' frame) */
+/* Paketi kuyruğa ekle (hook thread'lerinden çağrılır, WinHTTP'ye dokunmaz) */
+static void px_forward(uint8_t dir, const uint8_t *data, int len) {
+    if (!data || len <= 0) return;
+    if (!InterlockedCompareExchange(&g_px_ready, 0, 0)) return;
+    uint8_t *buf = (uint8_t*)malloc(PX_HDR + len);
+    if (!buf) return;
+    uint32_t u32 = (uint32_t)len;
+    buf[0] = PX_TYPE_PKT; buf[1] = dir;
+    memcpy(buf+2, &u32, 4);
+    memcpy(buf+6, data, len);
+    px_enqueue(buf, (DWORD)(PX_HDR + len));
+}
+
+/* Kayıtlı challenge paketini kuyruğa ekle (0x43 'C' frame) */
 static void px_forward_challenge(void) {
-    if (!g_px_cs_ok) return;
     if (InterlockedCompareExchange(&g_saved_challenge_len, 0, 0) < CHALLENGE_SIZE) return;
     /* CAS: 0→1 başarılıysa biz göndeririz; aksi halde zaten gönderilmiş */
     if (InterlockedCompareExchange(&g_challenge_forwarded, 1, 0) != 0) return;
     if (!InterlockedCompareExchange(&g_px_ready, 0, 0)) {
         InterlockedExchange(&g_challenge_forwarded, 0); return;
     }
+    const DWORD clen = (DWORD)CHALLENGE_SIZE;
+    uint8_t *buf = (uint8_t*)malloc(PX_HDR + clen);
+    if (!buf) { InterlockedExchange(&g_challenge_forwarded, 0); return; }
+    buf[0] = PX_TYPE_CHALLENGE; buf[1] = PX_DIR_RECV;
+    memcpy(buf+2, &clen, 4);
+    /* g_saved_challenge'ı okumak için g_px_cs yeterli değil; ayrı CS kullanıyoruz */
     EnterCriticalSection(&g_px_cs);
-    HINTERNET ws = g_px_ws;
-    if (ws) {
-        const DWORD clen = (DWORD)CHALLENGE_SIZE;
-        uint8_t *buf = (uint8_t*)malloc(PX_HDR + clen);
-        if (buf) {
-            buf[0] = PX_TYPE_CHALLENGE;
-            buf[1] = PX_DIR_RECV;
-            memcpy(buf + 2, &clen, 4);
-            memcpy(buf + 6, g_saved_challenge, clen);
-            WinHttpWebSocketSend(ws,
-                WINHTTP_WEB_SOCKET_BINARY_MESSAGE_BUFFER_TYPE,
-                buf, (DWORD)(PX_HDR + clen));
-            free(buf);
-        }
-    }
+    memcpy(buf+6, g_saved_challenge, clen);
     LeaveCriticalSection(&g_px_cs);
+    px_enqueue(buf, (DWORD)(PX_HDR + clen));
 }
 
 /* Blowfish anahtarını Python proxy'ye ilet (BF_KEY_SIZE = 4168 byte) */
 static volatile LONG g_key_forwarded = 0;   /* her bağlantıda bir kez gönder */
 
 static void px_forward_key(const uint8_t *bf_key_bytes) {
-    if (!g_px_cs_ok || !bf_key_bytes) return;
-    if (!InterlockedCompareExchange(&g_px_ready, 0, 0)) return;
-
+    if (!bf_key_bytes) return;
+    /* Anahtarı sakla + key-ready event'ını sinyal ver (bağlantı hâlâ yok olsa bile) */
     EnterCriticalSection(&g_px_cs);
-    HINTERNET ws = g_px_ws;
-    if (ws) {
-        const DWORD klen = (DWORD)BF_KEY_SIZE;
-        uint8_t *buf = (uint8_t*)malloc(PX_HDR + klen);
-        if (buf) {
-            buf[0] = PX_TYPE_KEY;
-            buf[1] = 0;
-            memcpy(buf + 2, &klen, 4);
-            memcpy(buf + 6, bf_key_bytes, klen);
-            WinHttpWebSocketSend(ws,
+    memcpy(g_saved_key, bf_key_bytes, BF_KEY_SIZE);
+    LeaveCriticalSection(&g_px_cs);
+    InterlockedExchange(&g_saved_key_valid, 1);
+    if (g_px_key_event) SetEvent(g_px_key_event); /* px_thread_fn'i uyandır */
+
+    /* Bağlantı zaten kurulmuşsa kuyruğa ekle */
+    if (!InterlockedCompareExchange(&g_px_ready, 0, 0)) return;
+    const DWORD klen = (DWORD)BF_KEY_SIZE;
+    uint8_t *buf = (uint8_t*)malloc(PX_HDR + klen);
+    if (!buf) return;
+    buf[0] = PX_TYPE_KEY; buf[1] = 0;
+    memcpy(buf+2, &klen, 4);
+    memcpy(buf+6, bf_key_bytes, klen);
+    px_enqueue(buf, (DWORD)(PX_HDR + klen));
+}
+
+/* ── Send thread: kuyruğu boşalt, WinHttpWebSocketSend'i tek thread'den çağır ── */
+typedef struct { HINTERNET ws; volatile LONG stop; } PxSendCtx;
+
+static DWORD WINAPI px_send_thread_fn(LPVOID param) {
+    PxSendCtx *ctx = (PxSendCtx*)param;
+    while (!InterlockedCompareExchange(&ctx->stop, 0, 0) &&
+           !InterlockedCompareExchange(&g_px_stop,  0, 0)) {
+        DWORD w = WaitForSingleObject(g_pxq_sem, 200);
+        if (w == WAIT_TIMEOUT) continue;
+        if (w != WAIT_OBJECT_0) break;
+
+        /* Dequeue */
+        EnterCriticalSection(&g_pxq_cs);
+        LONG r      = g_pxq_r;
+        uint8_t *data = g_pxq[r].data;
+        DWORD    len  = g_pxq[r].len;
+        g_pxq[r].data = NULL;
+        g_pxq_r = (r + 1) % PXQ_SLOTS;
+        LeaveCriticalSection(&g_pxq_cs);
+
+        if (data) {
+            WinHttpWebSocketSend(ctx->ws,
                 WINHTTP_WEB_SOCKET_BINARY_MESSAGE_BUFFER_TYPE,
-                buf, (DWORD)(PX_HDR + klen));
-            free(buf);
+                data, len);
+            free(data);
         }
     }
-    LeaveCriticalSection(&g_px_cs);
+    /* Kalan frame'leri temizle */
+    EnterCriticalSection(&g_pxq_cs);
+    while (g_pxq_r != g_pxq_w) {
+        free(g_pxq[g_pxq_r].data);
+        g_pxq[g_pxq_r].data = NULL;
+        g_pxq_r = (g_pxq_r + 1) % PXQ_SLOTS;
+    }
+    LeaveCriticalSection(&g_pxq_cs);
+    return 0;
 }
 
 /* Proxy thread: bağlan, inject komutlarını oku, kopar → tekrar bağlan */
@@ -908,6 +966,27 @@ static DWORD WINAPI px_upload_thread_fn(LPVOID param); /* forward decl */
 
 static DWORD WINAPI px_thread_fn(LPVOID param) {
     (void)param;
+
+    /* Anahtar bulunana kadar bekle — oyun login/sunucu ekranı geçildikten
+     * SONRA bağlantı kur; WinHTTP handshake kritik aşamayla çakışmaz.   */
+    if (g_px_key_event) {
+        if (g_log_net) {
+            log_time(g_log_net);
+            fprintf(g_log_net,
+                "PROXY: BF_KEY bekleniyor — key gelince WS bağlantısı başlayacak\n");
+            fflush(g_log_net);
+        }
+        /* g_px_stop sinyal verirse de çık */
+        HANDLE wait_h[2] = { g_px_key_event, g_scan_shutdown };
+        WaitForMultipleObjects(2, wait_h, FALSE, INFINITE);
+        if (InterlockedCompareExchange(&g_px_stop, 0, 0)) return 0;
+    }
+
+    if (g_log_net) {
+        log_time(g_log_net);
+        fprintf(g_log_net, "PROXY: BF_KEY alındı — WS bağlantısı başlıyor\n");
+        fflush(g_log_net);
+    }
 
     while (!InterlockedCompareExchange(&g_px_stop,0,0)) {
 
@@ -968,7 +1047,24 @@ static DWORD WINAPI px_thread_fn(LPVOID param) {
         /* Yeniden bağlanmada anahtarın tekrar gönderilmesi için sıfırla */
         InterlockedExchange(&g_key_forwarded, 0);
         InterlockedExchange(&g_challenge_forwarded, 0);
+        /* Kayıtlı key varsa hemen kuyruğa ekle */
+        if (InterlockedCompareExchange(&g_saved_key_valid, 0, 0)) {
+            const DWORD klen = (DWORD)BF_KEY_SIZE;
+            uint8_t *kbuf = (uint8_t*)malloc(PX_HDR + klen);
+            if (kbuf) {
+                kbuf[0] = PX_TYPE_KEY; kbuf[1] = 0;
+                memcpy(kbuf+2, &klen, 4);
+                EnterCriticalSection(&g_px_cs);
+                memcpy(kbuf+6, g_saved_key, klen);
+                LeaveCriticalSection(&g_px_cs);
+                px_enqueue(kbuf, (DWORD)(PX_HDR + klen));
+            }
+        }
         px_forward_challenge(); /* kayıtlı challenge varsa yeniden bağlantıda hemen gönder */
+
+        /* Send thread başlat — sadece bu thread WinHttpWebSocketSend çağırır */
+        PxSendCtx sctx; sctx.ws = ws; sctx.stop = 0;
+        HANDLE send_th = CreateThread(NULL, 0, px_send_thread_fn, &sctx, 0, NULL);
 
         /* Log dosyalarını ayrı thread'de yükle (WebSocket receive loop'unu bloklamamak için) */
         HANDLE upt = CreateThread(NULL, 0, px_upload_thread_fn, NULL, 0, NULL);
@@ -1006,8 +1102,13 @@ static DWORD WINAPI px_thread_fn(LPVOID param) {
             }
         }
 
-        /* Temizlik */
+        /* Send thread'i durdur — WinHTTP handle'ları kapatmadan ÖNCE */
         InterlockedExchange(&g_px_ready, 0);
+        InterlockedExchange(&sctx.stop, 1);
+        if (g_pxq_sem) ReleaseSemaphore(g_pxq_sem, 1, NULL); /* uyandır */
+        if (send_th) { WaitForSingleObject(send_th, 3000); CloseHandle(send_th); }
+
+        /* Temizlik */
         EnterCriticalSection(&g_px_cs);
         g_px_ws = NULL;
         LeaveCriticalSection(&g_px_cs);
@@ -1128,6 +1229,8 @@ static void px_init(void) {
 
 static void px_shutdown(void) {
     InterlockedExchange(&g_px_stop, 1);
+    /* px_thread_fn key event'ını bekliyorsa uyandır */
+    if (g_px_key_event) SetEvent(g_px_key_event);
     /* WS kapatılırsa receive loop hata döner, thread çıkar */
     EnterCriticalSection(&g_px_cs);
     HINTERNET ws = g_px_ws; g_px_ws = NULL;
@@ -1141,6 +1244,22 @@ static void px_shutdown(void) {
     }
     if (g_px_cs_ok)    { DeleteCriticalSection(&g_px_cs);    g_px_cs_ok    = FALSE; }
     if (g_px_gs_cs_ok) { DeleteCriticalSection(&g_px_gs_cs); g_px_gs_cs_ok = FALSE; }
+    /* Send queue temizlik */
+    if (g_pxq_sem) {
+        /* Kalan frame'leri serbest bırak */
+        if (g_pxq_cs_ok) {
+            EnterCriticalSection(&g_pxq_cs);
+            while (g_pxq_r != g_pxq_w) {
+                free(g_pxq[g_pxq_r].data);
+                g_pxq[g_pxq_r].data = NULL;
+                g_pxq_r = (g_pxq_r + 1) % PXQ_SLOTS;
+            }
+            LeaveCriticalSection(&g_pxq_cs);
+        }
+        CloseHandle(g_pxq_sem); g_pxq_sem = NULL;
+    }
+    if (g_pxq_cs_ok) { DeleteCriticalSection(&g_pxq_cs); g_pxq_cs_ok = FALSE; }
+    if (g_px_key_event) { CloseHandle(g_px_key_event); g_px_key_event = NULL; }
 }
 
 /* ══════════════════════════════════════════════════════ */
@@ -1805,6 +1924,12 @@ static BOOL CALLBACK do_init(PINIT_ONCE p, PVOID param, PVOID *ctx) {
     /* ── Python Proxy köprüsü ── */
     InitializeCriticalSection(&g_px_cs);
     g_px_cs_ok = TRUE;
+    /* Send queue başlat */
+    InitializeCriticalSection(&g_pxq_cs);
+    g_pxq_cs_ok = TRUE;
+    g_pxq_sem = CreateSemaphoreA(NULL, 0, PXQ_SLOTS, NULL);
+    /* Key-ready event (manual-reset, başlangıçta sinyalsiz) */
+    g_px_key_event = CreateEventA(NULL, TRUE, FALSE, NULL);
     if (px_read_cfg()) {
         g_px_enabled = TRUE;
         if (g_log_net) {

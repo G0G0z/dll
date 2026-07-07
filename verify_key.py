@@ -7,25 +7,32 @@ pb_net.log ağ trafiğiyle çapraz kontrol ederek
 gerçek Blowfish session key'i bulur.
 
 Yöntem (known-plaintext):
-  Tüm client→server paketleri IV=0 ile sıfırlanır.
-  Plaintext[0] = toplam paket boyutu (1 byte).
-  Plaintext[1] = 0x00.
+  Paket formatı (CONFIRMED): [1B payload_len][1B proto=0x0D][1B opcode][payload]
+  IV (CONFIRMED): challenge[3:11]  (202-byte server challenge'ın 3-10. baytları)
+  Endian: LE uint32 (oyun union{BF_LONG ul[2]; uint8 uc[8]} kullanıyor)
 
-  Bu durumda:
-    ks[0] = ciphertext[0] XOR packet_size_mod256
-    ks[1] = ciphertext[1]                   (çünkü pt[1]=0x00)
+  Client→server küçük paketler için:
+    pt[0] = payload_len = total_size - 3
+    pt[1] = 0x0D (proto byte — CONFIRMED, standart değil 0x00)
+
+  Keystream çıkarımı:
+    ks[0] = ct[0] XOR (size - 3)          (pt[0] bilindiği için)
+    ks[1] = ct[1] XOR 0x0D                (pt[1] = proto = 0x0D)
 
   Ve:
-    ks[0..7] = BF_encrypt(IV=0, IV=0) ile hesaplanan keystream
+    ks[0..7] = BF_encrypt(IV=challenge[3:11]) ile hesaplanan keystream
+    Onaylı keystream: ks[0]=0x00  ks[1]=0x8D
 
-  → BF_encrypt(0, 0)[0] == 0x03 ve [1] == 0x80 olmalı
+  NOT — Blowfish varyantı:
+    Standart Blowfish her turda L/R swap yapar; bu oyun yapmaz.
+    16 tur sonunda tek bir swap uygulanır.
 
 Kullanım:
   python verify_key.py pb_crypto.log pb_net.log
   python verify_key.py pb_crypto.log           # sadece P-array filtresi
 
 Seçenekler:
-  --ks HEXSTRING   Özel keystream baytları (varsayılan: 0380)
+  --ks HEXSTRING   Özel keystream baytları (varsayılan: net_log'dan otomatik)
   --verbose        Her aday için Blowfish sonucunu göster
   --dump FILE      Doğrulanan anahtarı dosyaya yaz
 """
@@ -38,28 +45,36 @@ from pathlib import Path
 # ─── Blowfish çekirdek (saf Python, harici kütüphane yok) ──────────────────
 
 def bf_encrypt_block(P: list, S: list, xl: int, xr: int) -> tuple:
-    """Tek 64-bit blok şifrele (P-array + S-boxes kullanarak)."""
+    """PointBlank Blowfish varyantı — NON-STANDARD round structure.
+
+    Standart Blowfish her turda L/R swap yapar; bu oyun yapmaz.
+    16 tur sonunda tek swap uygulanır.  decrypt_packets.py ve
+    crack_session_key.py ile uyumlu (paket invariant analizi ile teyit edildi).
+    """
     for i in range(16):
         xl ^= P[i]
         f  = (S[0][(xl >> 24) & 0xFF] + S[1][(xl >> 16) & 0xFF]) & 0xFFFFFFFF
         f ^= S[2][(xl >>  8) & 0xFF]
         f  = (f + S[3][xl & 0xFF]) & 0xFFFFFFFF
         xr ^= f
-        xl, xr = xr, xl
-    xl, xr = xr, xl
-    xr ^= P[16]
-    xl ^= P[17]
+        # Per-round swap YOK — intentional, oyun non-standard BF kullanıyor
+    xl, xr = xr, xl   # 16 tur sonunda tek swap
+    xl ^= P[16]
+    xr ^= P[17]
     return xl & 0xFFFFFFFF, xr & 0xFFFFFFFF
 
-def keystream_from_key(P: list, S: list, le: bool = False) -> bytes:
-    """IV=0 ile BF_encrypt(0, 0) → 8-byte keystream.
-    le=False → OpenSSL l2n/n2l yolu: big-endian (standart).
-    le=True  → union uc[] yolu: little-endian per 32-bit word.
-               Game'in custom implementasyonu bunu kullanıyor olabilir.
+def keystream_from_key(P: list, S: list, iv_bytes: bytes = bytes(8)) -> bytes:
+    """BF_encrypt(IV) → 8-byte keystream.
+
+    iv_bytes: 8-byte LE IV (varsayılan=sıfır; gerçek değer challenge[3:11]).
+    LE uint32 olarak oku — oyun union{BF_LONG ul[2]; uint8 uc[8]} kullanıyor.
+    Onaylı IV=challenge[3:11] ile: ks[0]=0x00  ks[1]=0x8D
     """
-    xl, xr = bf_encrypt_block(P, S, 0, 0)
-    order = 'little' if le else 'big'
-    return xl.to_bytes(4, order) + xr.to_bytes(4, order)
+    import struct
+    v0 = struct.unpack_from('<I', iv_bytes, 0)[0]
+    v1 = struct.unpack_from('<I', iv_bytes, 4)[0]
+    e0, e1 = bf_encrypt_block(P, S, v0, v1)
+    return e0.to_bytes(4, 'little') + e1.to_bytes(4, 'little')
 
 # ─── pb_crypto.log ayrıştırıcı ─────────────────────────────────────────────
 
