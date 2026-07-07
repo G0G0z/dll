@@ -85,9 +85,7 @@ def load_key(crypto_log, target_sig=CONFIRMED_SIG):
 
 # pb_net.log'daki her TCP/UDP satırını eşler
 def load_key_any(crypto_log):
-    """pb_crypto.log'dan son geçerli BF_KEY adayını yükle — SIG filtresi yok.
-    DLL her oturumda farklı bir anahtar üretir; CONFIRMED_SIG sadece belirli
-    bir oturuma aittir. Otomatik yükleme için son tam aday kullanılır."""
+    """pb_crypto.log'dan son geçerli BF_KEY adayını yükle — SIG filtresi yok."""
     cur_p, cur_s = None, []
     last_p, last_s = None, None
     try:
@@ -112,6 +110,70 @@ def load_key_any(crypto_log):
     if cur_p and len(cur_s) == 4:
         last_p, last_s = cur_p, list(cur_s)
     return last_p, last_s
+
+def load_all_candidates(crypto_log):
+    """pb_crypto.log'dan TÜM benzersiz BF_KEY adaylarını yükle.
+    Döndürür: list of (sig_tuple, P_list, S_lists)"""
+    candidates = {}   # sig → (P, S)
+    cur_p, cur_s, cur_sig = None, [], None
+    try:
+        with open(crypto_log, encoding='utf-8', errors='replace') as f:
+            for line in f:
+                s = line.strip()
+                if 'BF_KEY ADAYI' in s:
+                    if cur_p and len(cur_s) == 4:
+                        sig = cur_sig or (cur_s[0][0], cur_s[1][0], cur_s[2][0], cur_s[3][0])
+                        if sig not in candidates:
+                            candidates[sig] = (cur_p, list(cur_s))
+                    cur_p, cur_s, cur_sig = None, [], None
+                    continue
+                m = re.search(r'\[72 bytes\]:\s*([0-9a-fA-F]{144})', s)
+                if m:
+                    cur_p = list(struct.unpack('<18I', bytes.fromhex(m.group(1))))
+                    continue
+                m = re.search(r'S\[\d\] \(1024B\).*?\[1024 bytes\]:\s*([0-9a-fA-F]{2048})', s)
+                if m:
+                    cur_s.append(list(struct.unpack('<256I', bytes.fromhex(m.group(1)))))
+                    continue
+                m = re.search(
+                    r'\[SIG\]\s+S0_0=([0-9a-f]+)\s+S1_0=([0-9a-f]+)'
+                    r'\s+S2_0=([0-9a-f]+)\s+S3_0=([0-9a-f]+)', s)
+                if m:
+                    cur_sig = tuple(int(x, 16) for x in m.groups())
+    except OSError:
+        pass
+    if cur_p and len(cur_s) == 4:
+        sig = cur_sig or (cur_s[0][0], cur_s[1][0], cur_s[2][0], cur_s[3][0])
+        if sig not in candidates:
+            candidates[sig] = (cur_p, list(cur_s))
+    return list(candidates.values())   # [(P, S), ...]
+
+def crack_key(candidates, iv_bytes, test_packets, min_hits=2):
+    """Aday listesinden doğru anahtarı bul.
+    test_packets: list of (cipher_bytes, size) — RECV paketleri
+    Geçerlilik kriteri: plain[0]==(size-3)&0xFF  ve  plain[1]==0x0D
+    min_hits adayın en az kaç pakette eşleşmesi gerektiğini belirtir.
+    En çok eşleşen adayı döndürür; bulunamazsa (None, None)."""
+    best_p, best_s, best_hits = None, None, -1
+    for P, S in candidates:
+        hits = 0
+        iv_state = bytearray(iv_bytes)
+        n_state = 0
+        for cipher, size in test_packets:
+            plain, iv_state, n_state = _cfb64(P, S, cipher, bytes(iv_state),
+                                               encrypt=False, n_in=n_state)
+            iv_state = bytearray(iv_state)
+            expected_len = (size - 3) & 0xFF
+            if len(plain) >= 2 and plain[0] == expected_len and plain[1] == 0x0D:
+                hits += 1
+        if hits > best_hits:
+            best_hits, best_p, best_s = hits, P, S
+    if best_hits >= min_hits:
+        return best_p, best_s
+    # min_hits sağlanamadı; en azından 1 eşleşme varsa dön
+    if best_hits >= 1:
+        return best_p, best_s
+    return None, None
 
 _NET_PKT_RE = re.compile(
     r'TCP\s+(RECV|SEND)\s+[←→].*?\[(\d+)\s+bytes\]:\s*([0-9a-fA-F]+)',
@@ -153,6 +215,35 @@ def auto_load_session(crypto_path=None, net_path=None, sig=CONFIRMED_SIG):
             changed['iv'] = iv.hex()
     return changed
 
+# ─── Anahtar önbelleği (disk) ─────────────────────────────────────────────────
+
+KEY_CACHE_PATH = 'bf_key.bin'
+
+def save_key_cache(P, S):
+    """Anahtarı diske kaydet — sunucu yeniden başlatılınca tekrar yüklenebilsin."""
+    try:
+        data = struct.pack('<18I', *P)
+        for sbox in S:
+            data += struct.pack('<256I', *sbox)
+        with open(KEY_CACHE_PATH, 'wb') as f:
+            f.write(data)
+    except OSError as e:
+        print(f'[KEY] Önbellek yazma hatası: {e}')
+
+def load_key_cache():
+    """Daha önce kaydedilmiş anahtarı yükle."""
+    try:
+        with open(KEY_CACHE_PATH, 'rb') as f:
+            data = f.read()
+        expected = (18 + 4 * 256) * 4   # 4168 bytes
+        if len(data) < expected:
+            return None, None
+        P = list(struct.unpack_from('<18I', data, 0))
+        S = [list(struct.unpack_from('<256I', data, (18 + i * 256) * 4)) for i in range(4)]
+        return P, S
+    except OSError:
+        return None, None
+
 # ─── Oturum durumu ────────────────────────────────────────────────────────────
 
 class Session:
@@ -184,10 +275,13 @@ class Session:
         self.iv = iv_bytes
         self._reset_streams()
 
-    def set_key(self, P, S):
-        """Anahtarı ata ve IV mevcutsa akışları sıfırla."""
+    def set_key(self, P, S, save_cache=True):
+        """Anahtarı ata ve IV mevcutsa akışları sıfırla.
+        save_cache=True → bf_key.bin güncelle (sadece doğrulanmış anahtarlar için)."""
         self.P, self.S = P, S
         self._reset_streams()
+        if save_cache:
+            save_key_cache(P, S)
 
     def try_challenge(self, raw):
         """202-byte challenge → IV çıkar, CFB akışlarını sıfırla."""
@@ -456,8 +550,10 @@ async def on_dll_frame(data: bytes):
     raw = data[6: 6 + data_len]
     ts  = time.strftime('%H:%M:%S')
 
-    # Challenge tespiti (202B, 0xc5 ile başlar)
-    if direction == 'R' and session.try_challenge(raw):
+    # Challenge tespiti (tam 202B, 0xc5 ile başlar)
+    # ÖNEMLI: boyut kontrolü zorunlu — rastgele şifreli paket 0xc5 ile başlarsa
+    # yanlış IV atanır ve tüm akış bozulur (mismatch).
+    if direction == 'R' and len(raw) == 202 and session.try_challenge(raw):
         ev = fmt_packet(session.seq, 'R', raw, None, ts)
         ev['status'] = 'challenge'
         ev['note']   = f'IV={session.iv.hex()}'
@@ -576,6 +672,32 @@ async def on_ui_cmd(ws, cmd):
             await ws.send_json({'type': 'status', 'msg': f'Anahtar yüklendi: {path}', 'level': 'ok'})
         else:
             await ws.send_json({'type': 'status', 'msg': f'Anahtar bulunamadı: {path}', 'level': 'error'})
+
+    elif t == 'set_key_hex':
+        # Manuel anahtar girişi: P+S hex (4168B = 8336 hex kar.)
+        # ya da sadece P-array hex (72B = 144 hex kar.) — crypto log'dan kopyalanabilir
+        hex_raw = cmd.get('hex', '').replace(' ', '').replace('\n', '').lower()
+        try:
+            raw = bytes.fromhex(hex_raw)
+        except ValueError as e:
+            await ws.send_json({'type': 'status', 'msg': f'Geçersiz hex: {e}', 'level': 'error'})
+            return
+        expected = (18 + 4 * 256) * 4   # 4168 bytes tam anahtar
+        if len(raw) < expected:
+            await ws.send_json({'type': 'status',
+                                'msg': f'Anahtar çok kısa: {len(raw)}B (beklenen {expected}B)',
+                                'level': 'error'})
+            return
+        P = list(struct.unpack_from('<18I', raw, 0))
+        S = [list(struct.unpack_from('<256I', raw, (18 + i * 256) * 4)) for i in range(4)]
+        session.set_key(P, S)
+        sig = (S[0][0], S[1][0], S[2][0], S[3][0])
+        confirmed = '✓ ONAYLANDI' if sig == CONFIRMED_SIG else '(doğrulanmadı)'
+        msg = f'Manuel anahtar yüklendi {confirmed} — SIG={" ".join(f"{x:08x}" for x in sig)}'
+        print(f'[KEY] {msg}')
+        await broadcast({'type': 'key_loaded', 'iv': session.iv.hex() if session.iv else None})
+        await broadcast({'type': 'status', 'msg': msg, 'level': 'ok'})
+        await _redecrypt_session()
 
 async def broadcast(event):
     dead = set()
@@ -715,9 +837,16 @@ tbody tr.sel td{background:#1c2333!important}
   <div class="led" id="dll-led"></div>
   <h1>PointBlank Proxy</h1>
   <span id="hdr-status">DLL bekleniyor…</span>
-  <span class="badge" id="key-b">Anahtar: yok</span>
+  <span class="badge" id="key-b" title="Anahtara tıkla → manuel giriş" style="cursor:pointer" onclick="toggleKeyInput()">Anahtar: yok</span>
   <span class="badge" id="iv-b" style="display:none"></span>
   <span id="pkt-cnt">0 paket</span>
+</div>
+<div id="key-input-bar" style="display:none;background:var(--bg2);border-bottom:1px solid var(--border);padding:6px 14px;align-items:center;gap:8px;flex-shrink:0">
+  <span style="color:var(--gray);font-size:10px;white-space:nowrap">BF KEY HEX (4168B):</span>
+  <input id="key-hex-input" type="text" placeholder="P+S tam anahtar hex — pb_crypto.log'dan veya bf_key.bin'den kopyala"
+    style="flex:1;background:var(--bg3);border:1px solid var(--border);color:var(--green);padding:3px 8px;border-radius:4px;font-family:var(--mono);font-size:11px">
+  <button onclick="submitKeyHex()" style="background:var(--blue);border:none;color:#000;padding:3px 12px;border-radius:4px;cursor:pointer;font-size:11px;font-weight:700">Yükle</button>
+  <button onclick="toggleKeyInput()" style="background:transparent;border:1px solid var(--border);color:var(--gray);padding:3px 8px;border-radius:4px;cursor:pointer;font-size:11px">✕</button>
 </div>
 
 <div id="main">
@@ -858,6 +987,24 @@ function showStatus(msg, lv) {
   setTimeout(() => { el.style.color = ''; }, 5000);
 }
 function updCnt() { document.getElementById('pkt-cnt').textContent = packets.length + ' paket'; }
+
+// ── Manuel anahtar girişi ─────────────────────────────────────────────────────
+function toggleKeyInput() {
+  const bar = document.getElementById('key-input-bar');
+  const visible = bar.style.display === 'flex';
+  bar.style.display = visible ? 'none' : 'flex';
+  if (!visible) document.getElementById('key-hex-input').focus();
+}
+function submitKeyHex() {
+  const hex = document.getElementById('key-hex-input').value.trim();
+  if (!hex) return;
+  ws && ws.send(JSON.stringify({type: 'set_key_hex', hex}));
+  document.getElementById('key-input-bar').style.display = 'none';
+}
+document.getElementById('key-hex-input').addEventListener('keydown', e => {
+  if (e.key === 'Enter') { e.preventDefault(); submitKeyHex(); }
+  if (e.key === 'Escape') toggleKeyInput();
+});
 
 // ── Table ────────────────────────────────────────────────────────────────────
 const FDIR = () => document.getElementById('f-dir').value;
@@ -1130,7 +1277,7 @@ async def replay_handler(request):
         await broadcast({'type': 'packet', 'pkt': ev})
 
     return web.json_response({'ok': True, 'count': len(evs), 'path': path,
-                              'iv': replay_iv.hex() if replay_iv else None})
+                              'iv': session.iv.hex() if session.iv else None})
 
 # ─── App ─────────────────────────────────────────────────────────────────────
 
@@ -1169,13 +1316,49 @@ async def log_upload_handler(request):
 
     # ── Otomatik anahtar / IV güncelleme ──────────────────────────────────
     if name == 'pb_crypto.log':
-        # load_key_any: SIG filtresi olmadan son tam BF_KEY adayını yükle
-        P, S = load_key_any(path)
+        candidates = load_all_candidates(path)
+        P, S = None, None
+        crack_used = False
+
+        if candidates:
+            print(f'[KEY] {len(candidates)} aday yüklendi — crack deneniyor…')
+            # IV ve test paketleri mevcutsa otomatik crack
+            if session.iv:
+                test_pkts = [
+                    (bytes.fromhex(ev['raw_hex']), ev['size'])
+                    for ev in session.packets
+                    if ev.get('status') in ('encrypted', 'mismatch', 'ok', 'large')
+                    and ev.get('dir') == 'R'
+                    and ev.get('raw_hex')
+                    and ev.get('size', 0) <= 258   # küçük tam paketler
+                ][:20]
+                if test_pkts:
+                    P, S = crack_key(candidates, session.iv, test_pkts)
+                    if P and S:
+                        crack_used = True
+
+            # Crack başarısız veya test paketi yoksa: CONFIRMED_SIG ara, sonra son aday
+            if not (P and S):
+                # 1. Onaylı SIG'e sahip aday var mı?
+                for cp, cs in candidates:
+                    sig = (cs[0][0], cs[1][0], cs[2][0], cs[3][0])
+                    if sig == CONFIRMED_SIG:
+                        P, S = cp, cs
+                        break
+            if not (P and S):
+                # 2. Son aday
+                P, S = candidates[-1]
+
         if P and S:
-            session.set_key(P, S)
             sig = (S[0][0], S[1][0], S[2][0], S[3][0])
             sig_str = ' '.join(f'{x:08x}' for x in sig)
-            confirmed = '✓ ONAYLANDI' if sig == CONFIRMED_SIG else '(doğrulanmadı)'
+            is_confirmed = sig == CONFIRMED_SIG
+            # bf_key.bin'e sadece doğrulanmış anahtar yaz — yanlış aday önbelleği kirletmesin
+            save_cache = crack_used or is_confirmed
+            if not save_cache:
+                print(f'[KEY] Doğrulanmamış aday session\'a yüklendi (bf_key.bin korundu)')
+            session.set_key(P, S, save_cache=save_cache)
+            confirmed = '✓ ONAYLANDI' if is_confirmed else ('✓ CRACK' if crack_used else '(doğrulanmadı — önbelleksiz)')
             msg = f'[AUTO] Anahtar güncellendi {confirmed} — SIG={sig_str}'
             print(msg)
             await broadcast({'type': 'key_loaded',
@@ -1221,24 +1404,33 @@ def main():
 
     target_sig = tuple(int(x, 16) for x in args.sig.split())
 
-    # ── Anahtar yükleme sırası (en güncel log_data/ öncelikli) ───────────────
-    key_candidates = [
-        args.crypto,
-        'log_data/pb_crypto.log',
-        'pb_crypto.log',
-    ] + sorted(glob.glob('attached_assets/pb_crypto_*.log'), reverse=True)
-
-    for path in key_candidates:
-        if not path:
-            continue
-        P, S = load_key(path, target_sig)
-        if P and S:
-            session.set_key(P, S)
-            print(f'[KEY] ✓ Anahtar yüklendi: {path}')
-            print(f'[KEY]   SIG={" ".join(f"{x:08x}" for x in target_sig)}')
-            break
+    # ── Anahtar yükleme sırası ────────────────────────────────────────────────
+    # 1. Önbellek (bf_key.bin) — restart'ta kaybolmaz
+    P, S = load_key_cache()
+    if P and S:
+        session.set_key(P, S)
+        sig = (S[0][0], S[1][0], S[2][0], S[3][0])
+        confirmed = '✓ ONAYLANDI' if sig == target_sig else '(doğrulanmadı)'
+        print(f'[KEY] ✓ Önbellekten yüklendi {confirmed} — bf_key.bin')
     else:
-        print('[KEY] ✗ Anahtar bulunamadı — DLL bağlandığında otomatik yüklenecek.')
+        # 2. Crypto log dosyaları
+        key_candidates = [
+            args.crypto,
+            'log_data/pb_crypto.log',
+            'pb_crypto.log',
+        ] + sorted(glob.glob('attached_assets/pb_crypto_*.log'), reverse=True)
+
+        for path in key_candidates:
+            if not path:
+                continue
+            P, S = load_key(path, target_sig)
+            if P and S:
+                session.set_key(P, S)
+                print(f'[KEY] ✓ Anahtar yüklendi: {path}')
+                print(f'[KEY]   SIG={" ".join(f"{x:08x}" for x in target_sig)}')
+                break
+        else:
+            print('[KEY] ✗ Anahtar bulunamadı — DLL bağlandığında veya manuel giriş ile yüklenecek.')
 
     # ── IV yükleme sırası (pb_net.log'dan challenge[3:11]) ────────────────
     iv_candidates = [
