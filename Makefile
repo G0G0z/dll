@@ -15,7 +15,7 @@ all: $(TARGET)
 $(TARGET): $(SRC) libcrypto_proxy.def
 	$(ZIG) cc -target x86-windows-gnu -shared -O2 \
 	    -o $(TARGET) $(SRC) \
-	    -lkernel32 -lws2_32
+	    -lkernel32 -lws2_32 -lwinhttp
 	@echo ""
 	@echo "✓ Derleme tamam: $(TARGET)"
 	@ls -lh $(TARGET)

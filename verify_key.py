@@ -181,7 +181,8 @@ def extract_keystream_check(net_log: str) -> dict | None:
     ks0_votes: dict[int, int] = {}
     ks1_votes: dict[int, int] = {}
     for s in samples:
-        k0 = s['raw'][0] ^ (s['size'] & 0xFF)
+        # pt[0] = payload_len = size - 3  (format: [1B len][1B proto][1B op][payload])
+        k0 = s['raw'][0] ^ ((s['size'] - 3) & 0xFF)
         k1 = s['raw'][1]  # pt[1]=0x00 varsayımı
         ks0_votes[k0] = ks0_votes.get(k0, 0) + 1
         ks1_votes[k1] = ks1_votes.get(k1, 0) + 1

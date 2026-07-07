@@ -84,8 +84,15 @@ print(f"    Hex: {target['raw'].hex()}")
 
 def bf_encrypt_block(data_pair, P, S):
     """
-    OpenSSL BF_encrypt on a 2-element list [L, R] (uint32 native LE).
-    Returns encrypted [L, R] in place.
+    PointBlank custom Blowfish block encrypt.
+
+    Non-standard round structure (confirmed by cipher analysis):
+    Standard Blowfish swaps L and R after every round; this game's
+    implementation does NOT swap per round — it accumulates all F(L_i)
+    into R, then performs a single swap at the end.
+    F function (same as standard): F(x) = ((S0[a]+S1[b]) ^ S2[c]) + S3[d]
+
+    Returns encrypted [L, R].
     """
     L, R = data_pair
     for i in range(16):
@@ -95,13 +102,12 @@ def bf_encrypt_block(data_pair, P, S):
         b = (L >> 16) & 0xFF
         c = (L >>  8) & 0xFF
         d =  L        & 0xFF
-        F = (((S[0][a] + S[1][b]) & 0xFFFFFFFF) ^ S[2][c] + S[3][d]) & 0xFFFFFFFF
+        F = ((S[0][a] + S[1][b]) & 0xFFFFFFFF) ^ S[2][c]
+        F = (F + S[3][d]) & 0xFFFFFFFF
         R ^= F
-        L, R = R, L
-    L, R = R, L          # undo last swap
-    L ^= P[16]
-    R ^= P[17]
-    return [L, R]
+        # No per-round swap — intentional (confirmed by packet invariant analysis)
+    L, R = R, L          # single swap at end
+    return [(L ^ P[16]) & 0xFFFFFFFF, (R ^ P[17]) & 0xFFFFFFFF]
 
 def bf_cfb64_decrypt(ciphertext, P, S, iv_bytes=None, le_iv=False):
     """

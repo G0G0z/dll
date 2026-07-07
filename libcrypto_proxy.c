@@ -27,9 +27,11 @@
 #include <windows.h>
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <winhttp.h>
 #include <stdio.h>
 #include <stdint.h>
 #include <string.h>
+#include <stdlib.h>
 
 /* ══════════════════════════════════════════════════════
  *  ORTAK YARDIMCILAR
@@ -680,6 +682,281 @@ static DWORD WINAPI immediate_scan_thread(LPVOID param) {
     return 0;
 }
 
+/* ══════════════════════════════════════════════════════
+ *  PYTHON PROXY — WinHTTP WebSocket Köprüsü
+ *  pb_proxy.cfg → server_url=wss://HOST/dll
+ *  DLL → Python: tüm GAME_PORT paketleri iletilir
+ *  Python → DLL: inject komutu alınır ve oyuna gönderilir
+ * ══════════════════════════════════════════════════════ */
+
+/* Frame başlık boyutu: type(1) dir(1) len_le32(4) = 6 bayt */
+#define PX_HDR          6
+#define PX_TYPE_PKT     0x50u   /* 'P' — paket bildirimi (DLL → Python) */
+#define PX_TYPE_INJ     0x49u   /* 'I' — inject komutu  (Python → DLL)  */
+#define PX_DIR_RECV     0x52u   /* 'R' — sunucudan gelen (recv)          */
+#define PX_DIR_SEND     0x53u   /* 'S' — sunucuya giden  (send)          */
+
+/* ── Config ── */
+static wchar_t       g_px_host[512]  = {0};
+static INTERNET_PORT g_px_port       = INTERNET_DEFAULT_HTTPS_PORT;
+static wchar_t       g_px_path[256]  = {L"/dll"};
+static BOOL          g_px_tls        = TRUE;
+static BOOL          g_px_enabled    = FALSE;
+
+/* ── Runtime ── */
+static volatile LONG g_px_stop       = 0;
+static volatile LONG g_px_ready      = 0;
+static HINTERNET     g_px_ws         = NULL;
+static CRITICAL_SECTION g_px_cs;
+static BOOL          g_px_cs_ok      = FALSE;
+static HANDLE        g_px_thread     = NULL;
+
+/* ── Oyun soketi halkası (inject için) ── */
+#define PX_MAX_GS  4
+static SOCKET        g_px_gs[PX_MAX_GS];
+static int           g_px_gs_head    = 0;
+static CRITICAL_SECTION g_px_gs_cs;
+static BOOL          g_px_gs_cs_ok   = FALSE;
+
+/* ─────────────────────────────────────────────────── */
+
+static BOOL px_read_cfg(void) {
+    char fpath[MAX_PATH];
+    make_path(fpath, "pb_proxy.cfg");
+    FILE *f = fopen(fpath, "r");
+    if (!f) return FALSE;
+
+    char line[1024];
+    BOOL found = FALSE;
+    while (fgets(line, sizeof(line), f) && !found) {
+        char *p = line;
+        while (*p == ' ' || *p == '\t') p++;
+        if (*p == '#' || *p == '\r' || *p == '\n' || !*p) continue;
+        if (strncmp(p, "server_url=", 11) != 0) continue;
+
+        char url[512] = {0};
+        strncpy(url, p + 11, sizeof(url) - 1);
+        for (int i = (int)strlen(url)-1; i >= 0; i--) {
+            if (url[i]=='\r'||url[i]=='\n'||url[i]==' ') url[i]=0; else break;
+        }
+
+        char *host_start = url;
+        if      (strncmp(url,"wss://",6)==0){g_px_tls=TRUE; host_start=url+6; g_px_port=INTERNET_DEFAULT_HTTPS_PORT;}
+        else if (strncmp(url,"ws://", 5)==0){g_px_tls=FALSE;host_start=url+5; g_px_port=INTERNET_DEFAULT_HTTP_PORT;}
+
+        char host_a[256]={0}, path_a[256]="/dll";
+        char *slash = strchr(host_start, '/');
+        if (slash) {
+            size_t hl = (size_t)(slash - host_start);
+            if (hl >= sizeof(host_a)) hl = sizeof(host_a)-1;
+            memcpy(host_a, host_start, hl);
+            snprintf(path_a, sizeof(path_a), "%s", slash);
+        } else {
+            strncpy(host_a, host_start, sizeof(host_a)-1);
+        }
+        /* Port override: host:PORT */
+        char *colon = strrchr(host_a, ':');
+        if (colon) { *colon = 0; g_px_port = (INTERNET_PORT)atoi(colon+1); }
+
+        MultiByteToWideChar(CP_UTF8,0,host_a,-1,g_px_host,512);
+        MultiByteToWideChar(CP_UTF8,0,path_a,-1,g_px_path,256);
+        found = TRUE;
+    }
+    fclose(f);
+    return found;
+}
+
+/* Oyun soketini takip et */
+static void px_track(SOCKET s) {
+    if (!g_px_gs_cs_ok || s == INVALID_SOCKET) return;
+    EnterCriticalSection(&g_px_gs_cs);
+    for (int i = 0; i < PX_MAX_GS; i++) if (g_px_gs[i]==s) goto done;
+    g_px_gs[g_px_gs_head] = s;
+    g_px_gs_head = (g_px_gs_head+1) % PX_MAX_GS;
+done:
+    LeaveCriticalSection(&g_px_gs_cs);
+}
+
+/* En son oyun soketini döndür */
+static SOCKET px_gsock(void) {
+    if (!g_px_gs_cs_ok) return INVALID_SOCKET;
+    EnterCriticalSection(&g_px_gs_cs);
+    SOCKET ret = g_px_gs[(g_px_gs_head-1+PX_MAX_GS) % PX_MAX_GS];
+    LeaveCriticalSection(&g_px_gs_cs);
+    return ret;
+}
+
+/* Paketi Python proxy'ye ilet (thread-safe) */
+static void px_forward(uint8_t dir, const uint8_t *data, int len) {
+    if (!g_px_cs_ok || !data || len<=0) return;
+    if (!InterlockedCompareExchange(&g_px_ready,0,0)) return;
+
+    EnterCriticalSection(&g_px_cs);
+    HINTERNET ws = g_px_ws;
+    if (ws) {
+        uint8_t *buf = (uint8_t*)malloc(PX_HDR + len);
+        if (buf) {
+            uint32_t u32 = (uint32_t)len;
+            buf[0] = PX_TYPE_PKT;
+            buf[1] = dir;
+            memcpy(buf+2, &u32, 4);
+            memcpy(buf+6, data, len);
+            WinHttpWebSocketSend(ws,
+                WINHTTP_WEB_SOCKET_BINARY_MESSAGE_BUFFER_TYPE,
+                buf, (DWORD)(PX_HDR+len));
+            free(buf);
+        }
+    }
+    LeaveCriticalSection(&g_px_cs);
+}
+
+/* Proxy thread: bağlan, inject komutlarını oku, kopar → tekrar bağlan */
+static DWORD WINAPI px_thread_fn(LPVOID param) {
+    (void)param;
+
+    while (!InterlockedCompareExchange(&g_px_stop,0,0)) {
+
+        HINTERNET sess = WinHttpOpen(
+            L"PBProxy/1.0",
+            WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+            WINHTTP_NO_PROXY_NAME,
+            WINHTTP_NO_PROXY_BYPASS, 0);
+        if (!sess) { Sleep(3000); continue; }
+
+        HINTERNET conn = WinHttpConnect(sess, g_px_host, g_px_port, 0);
+        if (!conn) { WinHttpCloseHandle(sess); Sleep(3000); continue; }
+
+        DWORD rf = g_px_tls ? WINHTTP_FLAG_SECURE : 0;
+        HINTERNET req = WinHttpOpenRequest(
+            conn, L"GET", g_px_path,
+            NULL, WINHTTP_NO_REFERER,
+            WINHTTP_DEFAULT_ACCEPT_TYPES, rf);
+        if (!req) {
+            WinHttpCloseHandle(conn); WinHttpCloseHandle(sess);
+            Sleep(3000); continue;
+        }
+
+        /* TLS sertifika doğrulama (self-signed / dev domain için gevşet) */
+        if (g_px_tls) {
+            DWORD sf = SECURITY_FLAG_IGNORE_CERT_WRONG_USAGE
+                      |SECURITY_FLAG_IGNORE_CERT_CN_INVALID
+                      |SECURITY_FLAG_IGNORE_CERT_DATE_INVALID
+                      |SECURITY_FLAG_IGNORE_UNKNOWN_CA;
+            WinHttpSetOption(req, WINHTTP_OPTION_SECURITY_FLAGS, &sf, sizeof(sf));
+        }
+
+        BOOL ok =
+            WinHttpSetOption(req, WINHTTP_OPTION_UPGRADE_TO_WEB_SOCKET, NULL, 0) &&
+            WinHttpSendRequest(req, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
+                               WINHTTP_NO_REQUEST_DATA, 0, 0, 0) &&
+            WinHttpReceiveResponse(req, NULL);
+
+        if (!ok) {
+            WinHttpCloseHandle(req);
+            WinHttpCloseHandle(conn); WinHttpCloseHandle(sess);
+            Sleep(3000); continue;
+        }
+
+        HINTERNET ws = WinHttpWebSocketCompleteUpgrade(req, 0);
+        WinHttpCloseHandle(req);
+
+        if (!ws) {
+            WinHttpCloseHandle(conn); WinHttpCloseHandle(sess);
+            Sleep(3000); continue;
+        }
+
+        /* Hazır — global'a yaz */
+        EnterCriticalSection(&g_px_cs);
+        g_px_ws = ws;
+        LeaveCriticalSection(&g_px_cs);
+        InterlockedExchange(&g_px_ready, 1);
+
+        if (g_log_net) {
+            log_time(g_log_net);
+            fprintf(g_log_net,
+                "PROXY: *** WebSocket bağlandı → %ls:%u%ls ***\n",
+                g_px_host, (unsigned)g_px_port, g_px_path);
+            fflush(g_log_net);
+        }
+
+        /* Receive loop — inject komutlarını bekle */
+        uint8_t rxbuf[65540];
+        while (!InterlockedCompareExchange(&g_px_stop,0,0)) {
+            DWORD nread = 0;
+            WINHTTP_WEB_SOCKET_BUFFER_TYPE btype;
+            DWORD r = WinHttpWebSocketReceive(
+                ws, rxbuf, sizeof(rxbuf), &nread, &btype);
+            if (r != ERROR_SUCCESS) break;
+            if (btype != WINHTTP_WEB_SOCKET_BINARY_MESSAGE_BUFFER_TYPE) continue;
+            if (nread < PX_HDR) continue;
+
+            /* Inject frame: [0x49][0x00][4B len LE][ciphertext] */
+            if (rxbuf[0] == PX_TYPE_INJ) {
+                uint32_t dlen;
+                memcpy(&dlen, rxbuf+2, 4);
+                if (dlen > 0 && dlen <= nread - PX_HDR && d_send.installed) {
+                    SOCKET gs = px_gsock();
+                    if (gs != INVALID_SOCKET)
+                        ((fn_send_t)d_send.orig_fn)(
+                            gs, (const char*)(rxbuf+PX_HDR), (int)dlen, 0);
+                }
+            }
+        }
+
+        /* Temizlik */
+        InterlockedExchange(&g_px_ready, 0);
+        EnterCriticalSection(&g_px_cs);
+        g_px_ws = NULL;
+        LeaveCriticalSection(&g_px_cs);
+        WinHttpWebSocketClose(ws, WINHTTP_WEB_SOCKET_SUCCESS_CLOSE_STATUS, NULL, 0);
+        WinHttpCloseHandle(ws);
+        WinHttpCloseHandle(conn);
+        WinHttpCloseHandle(sess);
+
+        if (g_log_net) {
+            log_time(g_log_net);
+            fprintf(g_log_net, "PROXY: WebSocket bağlantısı kesildi\n");
+            fflush(g_log_net);
+        }
+        if (!InterlockedCompareExchange(&g_px_stop,0,0)) Sleep(3000);
+    }
+    return 0;
+}
+
+static void px_init(void) {
+    if (!g_px_enabled || !g_px_cs_ok) return;
+    InitializeCriticalSection(&g_px_gs_cs);
+    g_px_gs_cs_ok = TRUE;
+    memset(g_px_gs, 0xFF, sizeof(g_px_gs));  /* INVALID_SOCKET */
+    g_px_thread = CreateThread(NULL, 0, px_thread_fn, NULL, 0, NULL);
+    if (g_log_net) {
+        log_time(g_log_net);
+        fprintf(g_log_net,
+            "PROXY: thread başlatıldı → %ls:%u%ls\n",
+            g_px_host, (unsigned)g_px_port, g_px_path);
+        fflush(g_log_net);
+    }
+}
+
+static void px_shutdown(void) {
+    InterlockedExchange(&g_px_stop, 1);
+    /* WS kapatılırsa receive loop hata döner, thread çıkar */
+    EnterCriticalSection(&g_px_cs);
+    HINTERNET ws = g_px_ws; g_px_ws = NULL;
+    LeaveCriticalSection(&g_px_cs);
+    if (ws) WinHttpWebSocketClose(
+        ws, WINHTTP_WEB_SOCKET_ABORTED_CLOSE_STATUS, NULL, 0);
+    if (g_px_thread) {
+        WaitForSingleObject(g_px_thread, 3000);
+        CloseHandle(g_px_thread);
+        g_px_thread = NULL;
+    }
+    if (g_px_cs_ok)    { DeleteCriticalSection(&g_px_cs);    g_px_cs_ok    = FALSE; }
+    if (g_px_gs_cs_ok) { DeleteCriticalSection(&g_px_gs_cs); g_px_gs_cs_ok = FALSE; }
+}
+
+/* ══════════════════════════════════════════════════════ */
+
 /* Oyun sunucusuna bağlanınca taramayı bir kere tetikle */
 static void trigger_memscan(void) {
     if (InterlockedCompareExchange(&g_scan_triggered, 1, 0) == 0) {
@@ -710,6 +987,9 @@ static int WINAPI hook_connect(SOCKET s,
             ensure_init();
             trigger_memscan();  /* gecikmeli (t+200ms) tarama */
         }
+            /* Oyun soketini proxy için takip et */
+        if (port == GAME_PORT) px_track(s);
+
         /* Port 39190: key exchange connect() SONRASI hemen gerçekleşir —
          * recv hook'tan önce anında tarama başlat */
         if (port == GAME_PORT && !memscan_is_done()) {
@@ -764,6 +1044,15 @@ static int WINAPI hook_send(SOCKET s, const char *buf, int len, int flags) {
         }
     }
 
+    if (ret > 0) {
+        struct sockaddr_in sa2; int sl2 = sizeof(sa2);
+        if (getpeername(s,(struct sockaddr*)&sa2,&sl2)==0
+            && ntohs(sa2.sin_port)==GAME_PORT) {
+            px_track(s);
+            px_forward(PX_DIR_SEND, (const uint8_t*)buf, ret);
+        }
+    }
+
     if (g_log_net && ret > 0) {
         char peer[64];
         socket_peer(s, peer, sizeof(peer));
@@ -811,6 +1100,14 @@ static int WINAPI hook_recv(SOCKET s, char *buf, int len, int flags) {
                     }
                 }
             }
+        }
+
+        /* Proxy'ye ilet */
+        {
+            struct sockaddr_in sa2; int sl2 = sizeof(sa2);
+            if (getpeername(s,(struct sockaddr*)&sa2,&sl2)==0
+                && ntohs(sa2.sin_port)==GAME_PORT)
+                px_forward(PX_DIR_RECV, (const uint8_t*)buf, ret);
         }
 
         if (g_log_net) {
@@ -1298,6 +1595,30 @@ static BOOL CALLBACK do_init(PINIT_ONCE p, PVOID param, PVOID *ctx) {
     /* WinSock inline detour'ları kur */
     install_winsock_hooks();
 
+    /* ── Python Proxy köprüsü ── */
+    InitializeCriticalSection(&g_px_cs);
+    g_px_cs_ok = TRUE;
+    if (px_read_cfg()) {
+        g_px_enabled = TRUE;
+        if (g_log_net) {
+            log_time(g_log_net);
+            fprintf(g_log_net,
+                "PROXY: Config okundu → %ls:%u%ls  tls=%d\n",
+                g_px_host, (unsigned)g_px_port, g_px_path, (int)g_px_tls);
+            fflush(g_log_net);
+        }
+        px_init();
+    } else {
+        if (g_log_net) {
+            log_time(g_log_net);
+            fprintf(g_log_net,
+                "PROXY: pb_proxy.cfg bulunamadı — proxy devre dışı\n"
+                "       Dosyayı oyun dizininde oluşturun:\n"
+                "         server_url=wss://HOST/dll\n");
+            fflush(g_log_net);
+        }
+    }
+
     return TRUE;
 }
 
@@ -1491,6 +1812,9 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD reason, LPVOID reserved) {
         DisableThreadLibraryCalls(hinstDLL);
         /* Ağır iş ensure_init() ile lazy yapılır */
     } else if (reason == DLL_PROCESS_DETACH) {
+        /* Proxy köprüsünü durdur (önce — WS thread'i log'a yazmayı bırakmalı) */
+        px_shutdown();
+
         /* Tarama thread'ini durdur */
         if (g_scan_shutdown) {
             SetEvent(g_scan_shutdown);

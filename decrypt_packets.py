@@ -33,7 +33,12 @@ ap.add_argument("--dump-all", action="store_true",
                 help="hex-dump every packet including large ones")
 ap.add_argument("--sig", default="c87bf7d2 64215ab6 4108fddb 5e2ee03f",
                 help="override target SIG (4 space-separated hex values)")
+ap.add_argument("--servers", default="31.169.73.205:39190,31.169.73.82:39190",
+                help="comma-separated list of game server IP:port pairs to capture "
+                     "(default covers both login and game servers)")
 args = ap.parse_args()
+
+GAME_SERVERS = [s.strip() for s in args.servers.split(",")]
 
 TARGET_SIG = tuple(int(x, 16) for x in args.sig.split())
 
@@ -208,12 +213,14 @@ def parse_frames(blob: bytes) -> list[dict]:
 print(f"\nLoading packets from {args.net} …")
 all_raw: list[tuple[str, str, int, bytes]] = []  # (ts, dir, size, data)
 
+_server_pat = "(?:" + "|".join(re.escape(s) for s in GAME_SERVERS) + ")"
+_pkt_re = re.compile(
+    r'\[(\d{2}:\d{2}:\d{2}\.\d{3})\]\s+TCP (RECV|SEND)\s+[←→]\s+'
+    + _server_pat + r'\b.*?\[(\d+) bytes\]:\s*([0-9a-fA-F]+)')
+
 with open(args.net, encoding="utf-8", errors="replace") as fh:
     for line in fh:
-        m = re.search(
-            r'\[(\d{2}:\d{2}:\d{2}\.\d{3})\]\s+TCP (RECV|SEND)\s+[←→]\s+'
-            r'31\.169\.73\.205:39190\b.*?\[(\d+) bytes\]:\s*([0-9a-fA-F]+)',
-            line)
+        m = _pkt_re.search(line)
         if m:
             ts        = m.group(1)
             direction = "recv" if m.group(2) == "RECV" else "send"
@@ -226,10 +233,13 @@ send_all = [(ts, d, n, r) for ts, d, n, r in all_raw if d == "send"]
 print(f"  {len(recv_all)} recv  {len(send_all)} send  ({len(all_raw)} total)")
 print(f"  recv sizes: {[n for _, _, n, _ in recv_all]}")
 print(f"  send sizes: {[n for _, _, n, _ in send_all]}")
+print(f"  servers:    {GAME_SERVERS}")
 
-# Challenge = first recv; session IV from bytes [3:11]
-challenge    = recv_all[0][3]          # 202B plaintext
-session_iv   = challenge[3:11]         # confirmed IV source
+# Challenge = first recv from the login server (smallest challenge / first in time)
+# session IV is derived from login-server challenge[3:11], which applies to ALL
+# server connections (login + game) — confirmed by packet invariant analysis.
+challenge    = recv_all[0][3]          # 202B plaintext (login server challenge)
+session_iv   = challenge[3:11]         # confirmed IV source for all connections
 
 # Encrypted traffic begins after these plaintext/RSA-layer packets:
 #   recv[0] = 202B challenge (plaintext, skip)
