@@ -672,21 +672,101 @@ async def dll_handler(request):
 # BF_KEY boyutu: P-array (18 × 4B) + S-box'lar (4 × 256 × 4B) = 4168 byte
 BF_KEY_SIZE = (18 + 4 * 256) * 4
 
-async def _handle_key_frame(raw: bytes):
-    """DLL'den gelen KEY frame (0x4B): BF_KEY otomatik yükle."""
-    if len(raw) < BF_KEY_SIZE:
+# ─── KEY frame yönetimi (debounce + skorlama) ─────────────────────────────────
+# DLL 20+ aday key gönderir; her birini hemen uygulamak yerine 0.5s bekleyip
+# CFB64 decrypt üzerinden en yüksek proto=0x0D oranını veren adayı seçiyoruz.
+
+_key_candidates: list[tuple] = []         # (P, S, sig) buffer
+_key_debounce_task: 'asyncio.Task | None' = None  # son bekleyen task
+
+def _score_key(P: list, S: list, test_pkts: list) -> int:
+    """Aday key'i test paketlerine karşı değerlendir.
+    Stateful CFB64 oynatır; proto=0x0D eşleşmesi başına 1 puan,
+    len_field de doğruysa +1 puan ekler."""
+    if not P or not S or not session.iv:
+        return 0
+    score = 0
+    iv, n = session.iv, 0
+    for raw, size in test_pkts:
+        try:
+            plain, iv, n = _cfb64(P, S, raw, iv, encrypt=False, n_in=n)
+            if len(plain) >= 2 and plain[1] == 0x0D:
+                score += 1
+                if len(plain) >= 3 and size <= 258:
+                    if plain[0] == (size - 3) & 0xFF:
+                        score += 1  # len_field de tutarlı
+        except Exception:
+            pass
+    return score
+
+async def _select_best_key():
+    """0.5s debounce sonrası: tüm aday key'leri skorla ve en iyiyi uygula."""
+    global _key_candidates
+    await asyncio.sleep(0.5)
+
+    candidates = list(_key_candidates)
+    _key_candidates.clear()
+    if not candidates:
         return
-    P = list(struct.unpack_from('<18I', raw, 0))
-    S = [list(struct.unpack_from('<256I', raw, (18 + i * 256) * 4)) for i in range(4)]
-    session.set_key(P, S)
-    sig = (S[0][0], S[1][0], S[2][0], S[3][0])
-    confirmed = '✓ ONAYLANDI' if sig == CONFIRMED_SIG else '(doğrulanmadı)'
-    sig_str   = ' '.join(f'{x:08x}' for x in sig)
-    msg = f'Anahtar DLL\'den otomatik yüklendi {confirmed} — SIG={sig_str}'
+
+    # Skorlama için küçük RECV paketleri kullan (tam decrypt edilememiş olanlar)
+    test_pkts = [
+        (bytes.fromhex(ev['raw_hex']), ev['size'])
+        for ev in session.packets[-40:]
+        if ev.get('raw_hex') and ev.get('dir') == 'R'
+        and ev.get('status') in ('encrypted', 'mismatch', 'ok', 'large')
+        and 3 <= ev.get('size', 0) <= 258
+    ][:15]
+
+    # Varsayılan: son gelen aday (en yeni tarama sonucu)
+    best_P, best_S, best_sig, best_score = candidates[-1]
+    for P, S, sig in candidates:
+        sc = _score_key(P, S, test_pkts)
+        if sig == CONFIRMED_SIG:
+            sc += 1000          # bilinen SIG varsa büyük bonus
+        if sc > best_score:
+            best_score, best_P, best_S, best_sig = sc, P, S, sig
+
+    # Test paketi yoksa ve zaten çalışan bir key varsa değiştirme
+    if not test_pkts and session.has_key() and best_score <= 0 and best_sig != CONFIRMED_SIG:
+        print(f'[KEY] Test paketi yok — mevcut anahtar korundu')
+        return
+
+    is_confirmed = best_sig == CONFIRMED_SIG
+    crack_ok     = best_score >= 3 and not is_confirmed
+    # bf_key.bin'e sadece güvenilir anahtarları yaz
+    save_cache   = is_confirmed or crack_ok
+    session.set_key(best_P, best_S, save_cache=save_cache)
+
+    sig_str = ' '.join(f'{x:08x}' for x in best_sig)
+    if is_confirmed:
+        label = '✓ ONAYLANDI'
+    elif crack_ok:
+        label = f'✓ CRACK (skor={best_score})'
+    else:
+        label = f'(varsayılan — son aday, skor={best_score})'
+    level = 'ok' if (is_confirmed or crack_ok) else 'warn'
+    msg   = f'Anahtar seçildi {label} — SIG={sig_str}  ({len(candidates)} adaydan)'
     print(f'[KEY] {msg}')
     await broadcast({'type': 'key_loaded', 'iv': session.iv.hex() if session.iv else None})
-    await broadcast({'type': 'status', 'msg': msg, 'level': 'ok'})
-    await _redecrypt_session()  # önceden encrypted gelen paketleri yeniden çöz
+    await broadcast({'type': 'status', 'msg': msg, 'level': level})
+    await _redecrypt_session()
+
+async def _handle_key_frame(raw: bytes):
+    """DLL'den gelen KEY frame (0x4B): adayı arabelleğe ekle, debounce ile seç."""
+    global _key_candidates, _key_debounce_task
+    if len(raw) < BF_KEY_SIZE:
+        return
+    P   = list(struct.unpack_from('<18I', raw, 0))
+    S   = [list(struct.unpack_from('<256I', raw, (18 + i * 256) * 4)) for i in range(4)]
+    sig = (S[0][0], S[1][0], S[2][0], S[3][0])
+    _key_candidates.append((P, S, sig))
+    sig_str = ' '.join(f'{x:08x}' for x in sig)
+    print(f'[KEY] Aday #{len(_key_candidates)} — SIG={sig_str}')
+    # Debounce: son aday geldikten 0.5s sonra en iyiyi seç
+    if _key_debounce_task and not _key_debounce_task.done():
+        _key_debounce_task.cancel()
+    _key_debounce_task = asyncio.create_task(_select_best_key())
 
 async def _redecrypt_session():
     """Tüm paketi baştan stateful oynat: RECV ve SEND CFB akışlarını sıfırlayıp
@@ -1002,15 +1082,38 @@ def build_teleport_pkt(target_id: int, x: float, y: float, z: float) -> bytes:
     return _mk_pkt(0x68, struct.pack('<Hfff', target_id, x, y, z))
 
 async def _inject_plain(ws, plain: bytes, action_label: str, pid: int):
-    """Plaintext paketi şifrele ve DLL'e gönder; sonucu ws'e bildir."""
+    """Plaintext paketi şifrele ve DLL'e gönder; sonucu ws'e bildir.
+
+    ÖNEMLİ — CFB stream desynci:
+    DLL inject'i hook_send'i tetiklemeden orig_send ile gönderir.
+    Bu yüzden inject cipher game server'ın state'ini ilerletir ama
+    game client habersiz kalır → sonraki gerçek paket game server'da
+    yanlış decrypt edilir → bağlantı kesilir.
+
+    Çözüm: şifrelemeden önce iv_send/n_send snapshot'ı alıp geri yükle.
+    Böylece Python tracking game client ile senkron kalır.
+    Game server desynci DLL tarafında çözülmeli (inject sonrası
+    game client state'ini de ilerletmek gerekir).
+    """
     if not session.dll_ws:
         await ws.send_json({'type': 'action_error', 'msg': 'DLL bağlı değil'})
         return
     if not session.has_key() or not session.has_iv():
         await ws.send_json({'type': 'action_error', 'msg': 'Anahtar / IV yok'})
         return
+
+    # Snapshot — inject orig_send ile gönderildiği için hook_send tetiklenmez;
+    # state'i geri yükleyerek Python tracking'i game client ile senkron tutuyoruz.
+    iv_snap = session.iv_send
+    n_snap  = session.n_send
+
     cipher = session.encrypt(plain)
-    frame  = bytes([0x49, 0x00]) + struct.pack('<I', len(cipher)) + cipher
+
+    # State'i geri yükle: game client inject'ten habersiz, Python bunu bilmeli.
+    session.iv_send = iv_snap
+    session.n_send  = n_snap
+
+    frame = bytes([0x49, 0x00]) + struct.pack('<I', len(cipher)) + cipher
     try:
         await session.dll_ws.send_bytes(frame)
         pname = session.players.get(pid, {}).get('name', f'ID={pid}')
@@ -1076,7 +1179,12 @@ async def on_ui_cmd(ws, cmd):
             await ws.send_json({'type': 'inject_error', 'msg': 'Anahtar veya IV yok'})
             return
 
+        # Snapshot/restore: inject orig_send ile gider, hook_send tetiklenmez.
+        # Python tracking'i bozmaması için iv_send geri yüklenir; DLL'den
+        # gelen px_forward echo frame'i durumu doğru konuma taşır.
+        iv_snap, n_snap = session.iv_send, session.n_send
         cipher = session.encrypt(plain)
+        session.iv_send, session.n_send = iv_snap, n_snap
         # DLL inject frame: 'I'(0x49) + 0x00 + [4B len LE] + cipher
         frame = bytes([0x49, 0x00]) + struct.pack('<I', len(cipher)) + cipher
         try:
@@ -1971,6 +2079,147 @@ function doInject() {
   const type = injectMode === 'raw' ? 'inject_raw' : 'inject';
   ws && ws.send(JSON.stringify({type, hex: raw}));
 }
+
+// ── Tab switching ────────────────────────────────────────────────────────────
+document.querySelectorAll('#rtab-bar .rtab').forEach(tab => {
+  tab.addEventListener('click', () => {
+    document.querySelectorAll('#rtab-bar .rtab').forEach(t => t.classList.remove('on'));
+    tab.classList.add('on');
+    document.querySelectorAll('.rtab-content').forEach(c => c.style.display = 'none');
+    const target = document.getElementById('tab-' + tab.dataset.tab);
+    if (target) target.style.display = 'flex';
+  });
+});
+
+// ── Players ──────────────────────────────────────────────────────────────────
+const RANK_NAMES = ['Acemi','Çavuş','Üstçavuş','Asteğmen','Teğmen','Üsteğmen',
+  'Yüzbaşı','Binbaşı','Yarbay','Albay','Tuğgeneral','Tümgeneral','Korgeneral',
+  'General','Mareşal Yrd','Mareşal','Büyük Mareşal'];
+
+function setPlayers(arr, state) {
+  // update state badge
+  gameState = state || 'lobby';
+  const stEl = document.getElementById('pl-state');
+  stEl.textContent = gameState;
+  stEl.className = gameState;
+
+  // rebuild lookup
+  players = {};
+  arr.forEach(p => { players[p.id] = p; });
+
+  document.getElementById('pl-cnt').textContent = arr.length + ' oyuncu';
+
+  const list = document.getElementById('pl-list');
+  if (!arr.length) {
+    list.innerHTML = '<div id="pl-empty">Henüz oyuncu gözlemlenmedi.<br>Oyuna girilince otomatik dolacak.</div>';
+    return;
+  }
+
+  // group by team
+  const teams = {};
+  arr.forEach(p => {
+    const t = p.team ?? 0;
+    if (!teams[t]) teams[t] = [];
+    teams[t].push(p);
+  });
+
+  let h = '';
+  Object.entries(teams).sort(([a],[b]) => +a - +b).forEach(([team, members]) => {
+    const teamLabel = team == 1 ? '🔵 Mavi Takım' : team == 2 ? '🔴 Kırmızı Takım' : '⬜ Takımsız';
+    const teamCls   = team == 1 ? 'pl-team-blue' : team == 2 ? 'pl-team-red' : 'pl-team-none';
+    h += `<div class="pl-team-hd ${teamCls}">${teamLabel}</div>`;
+    members.forEach(p => {
+      const alive = p.alive !== false;
+      const rankName = RANK_NAMES[p.rank] || ('Rütbe ' + (p.rank||0));
+      h += `<div class="pl-card">
+        <div class="pl-card-top">
+          <div class="pl-alive-dot ${alive?'alive':'dead'}"></div>
+          <div class="pl-name">${esc(p.name||'?')}</div>
+          <div class="pl-rank">${esc(rankName)}</div>
+          <div class="pl-id">ID ${+p.id}</div>
+          <div class="pl-kd">${+( p.kills||0)}K / ${+(p.deaths||0)}D</div>
+        </div>
+        <div class="pl-card-acts">
+          <button class="act-btn act-kill" onclick="playerAction(${+p.id},'kill')">☠ Kill</button>
+          <button class="act-btn act-kick" onclick="playerAction(${+p.id},'kick')">⚡ Kick</button>
+          <button class="act-btn act-edit" onclick="openModal(${+p.id})">✏ Düzenle</button>
+        </div>
+      </div>`;
+    });
+  });
+  list.innerHTML = h;
+}
+
+function playerAction(pid, action) {
+  ws && ws.send(JSON.stringify({type:'player_action', pid, action}));
+}
+
+function addActLog(msg, cls) {
+  const log = document.getElementById('pl-actlog');
+  const div = document.createElement('div');
+  div.className = 'al-line al-' + (cls||'info');
+  div.textContent = msg;
+  log.appendChild(div);
+  log.scrollTop = log.scrollHeight;
+}
+
+// ── Player refresh / clear ────────────────────────────────────────────────────
+document.getElementById('pl-refresh').addEventListener('click', () =>
+  ws && ws.send(JSON.stringify({type:'get_players'})));
+document.getElementById('pl-clear-btn').addEventListener('click', () =>
+  ws && ws.send(JSON.stringify({type:'clear_players'})));
+
+// ── Edit modal ────────────────────────────────────────────────────────────────
+function openModal(pid) {
+  modalPid = pid;
+  const p = players[pid] || {};
+  document.getElementById('modal-title').textContent = 'Oyuncu Düzenle — ' + esc(p.name||('ID '+pid));
+  document.getElementById('m-name').value  = p.name  || '';
+  document.getElementById('m-rank').value  = p.rank  ?? 0;
+  document.getElementById('m-item').value  = 0;
+  document.getElementById('m-qty').value   = 1;
+  document.getElementById('m-days').value  = 0;
+  document.getElementById('m-x').value     = 0;
+  document.getElementById('m-y').value     = 0;
+  document.getElementById('m-z').value     = 0;
+  document.getElementById('modal-st').textContent = '';
+  document.getElementById('pl-modal').classList.add('open');
+}
+
+function closeModal() {
+  document.getElementById('pl-modal').classList.remove('open');
+  modalPid = null;
+}
+
+document.getElementById('modal-close').addEventListener('click', closeModal);
+document.getElementById('modal-cancel-btn').addEventListener('click', closeModal);
+document.getElementById('modal-bg').addEventListener('click', closeModal);
+
+document.getElementById('m-apply-name').addEventListener('click', () => {
+  if (modalPid == null) return;
+  const name = document.getElementById('m-name').value.trim();
+  if (!name) return;
+  ws && ws.send(JSON.stringify({type:'player_action', pid:modalPid, action:'edit_name', name}));
+});
+document.getElementById('m-apply-rank').addEventListener('click', () => {
+  if (modalPid == null) return;
+  const rank = parseInt(document.getElementById('m-rank').value) || 0;
+  ws && ws.send(JSON.stringify({type:'player_action', pid:modalPid, action:'edit_rank', rank}));
+});
+document.getElementById('m-apply-item').addEventListener('click', () => {
+  if (modalPid == null) return;
+  const item_id = parseInt(document.getElementById('m-item').value) || 0;
+  const qty     = parseInt(document.getElementById('m-qty').value)  || 1;
+  const days    = parseInt(document.getElementById('m-days').value) || 0;
+  ws && ws.send(JSON.stringify({type:'player_action', pid:modalPid, action:'give_item', item_id, qty, days}));
+});
+document.getElementById('m-apply-tp').addEventListener('click', () => {
+  if (modalPid == null) return;
+  const x = parseFloat(document.getElementById('m-x').value) || 0;
+  const y = parseFloat(document.getElementById('m-y').value) || 0;
+  const z = parseFloat(document.getElementById('m-z').value) || 0;
+  ws && ws.send(JSON.stringify({type:'player_action', pid:modalPid, action:'teleport', x, y, z}));
+});
 </script>
 </body>
 </html>"""

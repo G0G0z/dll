@@ -757,6 +757,21 @@ static int           g_px_gs_head    = 0;
 static CRITICAL_SECTION g_px_gs_cs;
 static BOOL          g_px_gs_cs_ok   = FALSE;
 
+/* ── Async gönderim kuyruğu ─────────────────────────────────────────────────
+ * hook_send / hook_recv game'in ağ thread'ini bloklamadan paketleri kuyruğa
+ * atar; ayrı bir gönderim thread'i WebSocket üzerinden iletir.
+ * Böylece WinHttpWebSocketSend'in ağ gecikmesi oyun thread'ini etkilemez.
+ * ─────────────────────────────────────────────────────────────────────────*/
+#define PX_ASYNC_MAX  512   /* max bekleyen mesaj — dolunca düşür */
+typedef struct _PxMsg { uint8_t *buf; DWORD len; struct _PxMsg *next; } PxMsg;
+static PxMsg            *g_amsg_head  = NULL;
+static PxMsg            *g_amsg_tail  = NULL;
+static CRITICAL_SECTION  g_amsg_cs;
+static BOOL              g_amsg_cs_ok = FALSE;
+static HANDLE            g_amsg_event = NULL;  /* auto-reset — yeni mesaj sinyali */
+static HANDLE            g_asender    = NULL;  /* gönderim thread'i */
+static volatile LONG     g_amsg_count = 0;
+
 /* ─────────────────────────────────────────────────── */
 
 static BOOL px_read_cfg(void) {
@@ -825,82 +840,104 @@ static SOCKET px_gsock(void) {
     return ret;
 }
 
-/* Paketi Python proxy'ye ilet (thread-safe) */
-static void px_forward(uint8_t dir, const uint8_t *data, int len) {
-    if (!g_px_cs_ok || !data || len<=0) return;
-    if (!InterlockedCompareExchange(&g_px_ready,0,0)) return;
-
-    EnterCriticalSection(&g_px_cs);
-    HINTERNET ws = g_px_ws;
-    if (ws) {
-        uint8_t *buf = (uint8_t*)malloc(PX_HDR + len);
-        if (buf) {
-            uint32_t u32 = (uint32_t)len;
-            buf[0] = PX_TYPE_PKT;
-            buf[1] = dir;
-            memcpy(buf+2, &u32, 4);
-            memcpy(buf+6, data, len);
-            WinHttpWebSocketSend(ws,
-                WINHTTP_WEB_SOCKET_BINARY_MESSAGE_BUFFER_TYPE,
-                buf, (DWORD)(PX_HDR+len));
-            free(buf);
-        }
+/* ── px_enqueue: frame'i kuyruğa ekle (non-blocking) ──
+ * Dönüş: TRUE → kuyruğa eklendi; FALSE → başarısız (buf free edildi). */
+static BOOL px_enqueue(uint8_t *buf, DWORD len) {
+    if (!g_amsg_cs_ok || !g_amsg_event || !buf) { free(buf); return FALSE; }
+    if (InterlockedCompareExchange(&g_amsg_count, 0, 0) >= PX_ASYNC_MAX) {
+        free(buf); return FALSE;  /* kuyruk dolu — düşür */
     }
-    LeaveCriticalSection(&g_px_cs);
+    PxMsg *m = (PxMsg*)malloc(sizeof(PxMsg));
+    if (!m) { free(buf); return FALSE; }
+    m->buf = buf; m->len = len; m->next = NULL;
+    EnterCriticalSection(&g_amsg_cs);
+    if (g_amsg_tail) g_amsg_tail->next = m; else g_amsg_head = m;
+    g_amsg_tail = m;
+    LeaveCriticalSection(&g_amsg_cs);
+    InterlockedIncrement(&g_amsg_count);
+    SetEvent(g_amsg_event);
+    return TRUE;
 }
 
-/* Kayıtlı challenge paketini Python proxy'ye ilet (0x43 'C' frame) */
+/* ── px_sender_thread: kuyruğu boşalt → WebSocket gönder ── */
+static DWORD WINAPI px_sender_thread(LPVOID p) {
+    (void)p;
+    for (;;) {
+        DWORD r = WaitForSingleObject(g_amsg_event, 100);
+        if (r == WAIT_FAILED) break;
+        if (InterlockedCompareExchange(&g_px_stop, 0, 0)) break;
+        for (;;) {
+            PxMsg *m = NULL;
+            EnterCriticalSection(&g_amsg_cs);
+            if (g_amsg_head) {
+                m = g_amsg_head;
+                g_amsg_head = m->next;
+                if (!g_amsg_head) g_amsg_tail = NULL;
+            }
+            LeaveCriticalSection(&g_amsg_cs);
+            if (!m) break;
+            InterlockedDecrement(&g_amsg_count);
+            EnterCriticalSection(&g_px_cs);
+            if (g_px_ws && InterlockedCompareExchange(&g_px_ready, 0, 0))
+                WinHttpWebSocketSend(g_px_ws,
+                    WINHTTP_WEB_SOCKET_BINARY_MESSAGE_BUFFER_TYPE,
+                    m->buf, m->len);
+            LeaveCriticalSection(&g_px_cs);
+            free(m->buf);
+            free(m);
+        }
+    }
+    return 0;
+}
+
+/* Paketi Python proxy'ye ilet — NON-BLOCKING (kuyruğa ekler) */
+static void px_forward(uint8_t dir, const uint8_t *data, int len) {
+    if (!data || len <= 0) return;
+    if (!InterlockedCompareExchange(&g_px_ready, 0, 0)) return;
+    uint8_t *buf = (uint8_t*)malloc(PX_HDR + len);
+    if (!buf) return;
+    uint32_t u32 = (uint32_t)len;
+    buf[0] = PX_TYPE_PKT; buf[1] = dir;
+    memcpy(buf+2, &u32, 4);
+    memcpy(buf+6, data, len);
+    px_enqueue(buf, (DWORD)(PX_HDR + len));
+}
+
+/* Kayıtlı challenge paketini Python proxy'ye ilet — NON-BLOCKING */
 static void px_forward_challenge(void) {
-    if (!g_px_cs_ok) return;
     if (InterlockedCompareExchange(&g_saved_challenge_len, 0, 0) < CHALLENGE_SIZE) return;
-    /* CAS: 0→1 başarılıysa biz göndeririz; aksi halde zaten gönderilmiş */
     if (InterlockedCompareExchange(&g_challenge_forwarded, 1, 0) != 0) return;
     if (!InterlockedCompareExchange(&g_px_ready, 0, 0)) {
         InterlockedExchange(&g_challenge_forwarded, 0); return;
     }
+    const DWORD clen = (DWORD)CHALLENGE_SIZE;
+    uint8_t *buf = (uint8_t*)malloc(PX_HDR + clen);
+    if (!buf) { InterlockedExchange(&g_challenge_forwarded, 0); return; }
+    buf[0] = PX_TYPE_CHALLENGE;
+    buf[1] = PX_DIR_RECV;
+    memcpy(buf + 2, &clen, 4);
+    /* challenge verisi g_px_cs ile korunuyor — kısa kilit ile kopyala */
     EnterCriticalSection(&g_px_cs);
-    HINTERNET ws = g_px_ws;
-    if (ws) {
-        const DWORD clen = (DWORD)CHALLENGE_SIZE;
-        uint8_t *buf = (uint8_t*)malloc(PX_HDR + clen);
-        if (buf) {
-            buf[0] = PX_TYPE_CHALLENGE;
-            buf[1] = PX_DIR_RECV;
-            memcpy(buf + 2, &clen, 4);
-            memcpy(buf + 6, g_saved_challenge, clen);
-            WinHttpWebSocketSend(ws,
-                WINHTTP_WEB_SOCKET_BINARY_MESSAGE_BUFFER_TYPE,
-                buf, (DWORD)(PX_HDR + clen));
-            free(buf);
-        }
-    }
+    memcpy(buf + 6, g_saved_challenge, clen);
     LeaveCriticalSection(&g_px_cs);
+    /* Enqueue başarısız olursa bayrağı geri al — yeniden denenebilsin */
+    if (!px_enqueue(buf, (DWORD)(PX_HDR + clen)))
+        InterlockedExchange(&g_challenge_forwarded, 0);
 }
 
-/* Blowfish anahtarını Python proxy'ye ilet (BF_KEY_SIZE = 4168 byte) */
+/* Blowfish anahtarını Python proxy'ye ilet — NON-BLOCKING */
 static volatile LONG g_key_forwarded = 0;   /* her bağlantıda bir kez gönder */
 
 static void px_forward_key(const uint8_t *bf_key_bytes) {
-    if (!g_px_cs_ok || !bf_key_bytes) return;
+    if (!bf_key_bytes) return;
     if (!InterlockedCompareExchange(&g_px_ready, 0, 0)) return;
-
-    EnterCriticalSection(&g_px_cs);
-    HINTERNET ws = g_px_ws;
-    if (ws) {
-        const DWORD klen = (DWORD)BF_KEY_SIZE;
-        uint8_t *buf = (uint8_t*)malloc(PX_HDR + klen);
-        if (buf) {
-            buf[0] = PX_TYPE_KEY;
-            buf[1] = 0;
-            memcpy(buf + 2, &klen, 4);
-            memcpy(buf + 6, bf_key_bytes, klen);
-            WinHttpWebSocketSend(ws,
-                WINHTTP_WEB_SOCKET_BINARY_MESSAGE_BUFFER_TYPE,
-                buf, (DWORD)(PX_HDR + klen));
-            free(buf);
-        }
-    }
-    LeaveCriticalSection(&g_px_cs);
+    const DWORD klen = (DWORD)BF_KEY_SIZE;
+    uint8_t *buf = (uint8_t*)malloc(PX_HDR + klen);
+    if (!buf) return;
+    buf[0] = PX_TYPE_KEY; buf[1] = 0;
+    memcpy(buf + 2, &klen, 4);
+    memcpy(buf + 6, bf_key_bytes, klen);
+    px_enqueue(buf, (DWORD)(PX_HDR + klen));
 }
 
 /* Proxy thread: bağlan, inject komutlarını oku, kopar → tekrar bağlan */
@@ -999,9 +1036,14 @@ static DWORD WINAPI px_thread_fn(LPVOID param) {
                 memcpy(&dlen, rxbuf+2, 4);
                 if (dlen > 0 && dlen <= nread - PX_HDR && d_send.installed) {
                     SOCKET gs = px_gsock();
-                    if (gs != INVALID_SOCKET)
+                    if (gs != INVALID_SOCKET) {
                         ((fn_send_t)d_send.orig_fn)(
                             gs, (const char*)(rxbuf+PX_HDR), (int)dlen, 0);
+                        /* hook_send inject'i görmez (orig_send kullanıldı).
+                         * Python'un CFB iv_send state'ini game server ile
+                         * senkron tutmak için cipher'ı SEND paketi olarak geri ilet. */
+                        px_forward(PX_DIR_SEND, rxbuf + PX_HDR, (int)dlen);
+                    }
                 }
             }
         }
@@ -1116,6 +1158,13 @@ static void px_init(void) {
     InitializeCriticalSection(&g_px_gs_cs);
     g_px_gs_cs_ok = TRUE;
     memset(g_px_gs, 0xFF, sizeof(g_px_gs));  /* INVALID_SOCKET */
+
+    /* Async gönderim kuyruğunu başlat */
+    InitializeCriticalSection(&g_amsg_cs);
+    g_amsg_cs_ok = TRUE;
+    g_amsg_event = CreateEventA(NULL, FALSE, FALSE, NULL); /* auto-reset */
+    g_asender    = CreateThread(NULL, 0, px_sender_thread, NULL, 0, NULL);
+
     g_px_thread = CreateThread(NULL, 0, px_thread_fn, NULL, 0, NULL);
     if (g_log_net) {
         log_time(g_log_net);
@@ -1128,6 +1177,28 @@ static void px_init(void) {
 
 static void px_shutdown(void) {
     InterlockedExchange(&g_px_stop, 1);
+
+    /* Gönderim thread'ini uyandır ve bekle */
+    if (g_asender) {
+        if (g_amsg_event) SetEvent(g_amsg_event);
+        DWORD wait_r = WaitForSingleObject(g_asender, 2000);
+        CloseHandle(g_asender); g_asender = NULL;
+        /* Yalnızca thread gerçekten durduysa kaynakları serbest bırak.
+         * Zaman aşımı durumunda CS/event'e dokunmadan bırak — thread
+         * hâlâ çalışıyor olabilir, use-after-destroy crash'ini önler. */
+        if (wait_r == WAIT_OBJECT_0) {
+            /* Kalan kuyruğu boşalt */
+            if (g_amsg_cs_ok) {
+                EnterCriticalSection(&g_amsg_cs);
+                PxMsg *m = g_amsg_head; g_amsg_head = g_amsg_tail = NULL;
+                LeaveCriticalSection(&g_amsg_cs);
+                while (m) { PxMsg *nx = m->next; free(m->buf); free(m); m = nx; }
+            }
+            if (g_amsg_event) { CloseHandle(g_amsg_event); g_amsg_event = NULL; }
+            if (g_amsg_cs_ok) { DeleteCriticalSection(&g_amsg_cs); g_amsg_cs_ok = FALSE; }
+        }
+    }
+
     /* WS kapatılırsa receive loop hata döner, thread çıkar */
     EnterCriticalSection(&g_px_cs);
     HINTERNET ws = g_px_ws; g_px_ws = NULL;
