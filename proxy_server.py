@@ -353,118 +353,171 @@ _OPCODES: dict[int, tuple[str, str, str]] = {
     # Yön: 'C→S' istemci→sunucu · 'S→C' sunucu→istemci · 'both' her iki yön
     # Güven seviyesi notları:
     #   [✓] Gerçek trafik verisiyle doğrulanmış (decrypt=ok, payload incelendi)
-    #   [~] Protokol akışından çıkarılan tahmin
-    #   [?] Bilinmiyor / spekülatif
+    #   [~] Protokol akışından / DLL kayıt düzeninden güçlü çıkarım
+    #   [?] Bilinmiyor / spekülatif — ham hex görüldü ama içerik net değil
     # ══════════════════════════════════════════════════════════════
-    # ── Bağlantı / Oturum ──────────────────────────────────────
-    0x01: ('CONNECT',       'C→S',  'Bağlantı isteği — TCP bağlantı kurulduktan sonra ilk paket [~]'),
-    0x02: ('PING',          'both', 'Canlı tutma ping — her iki yönde çalışır [~]'),
-    0x03: ('PONG',          'both', 'Canlı tutma pong yanıtı [~]'),
-    0x04: ('DISCONNECT',    'both', 'Bağlantı kesme bildirimi — istemci veya sunucu [~]'),
-    0x05: ('HANDSHAKE',     'both', 'El sıkışma / kriptografi başlatma [~]'),
-    0x06: ('SESSION_OK',    'S→C',  'Oturum onayı — sunucu bağlantıyı kabul etti [~]'),
-    0x07: ('RECONNECT',     'C→S',  'Yeniden bağlantı isteği — oturum ID ile [~]'),
-    0x08: ('ECHO',          'both', 'Bağlantı test echo — RTT ölçümü [~]'),
-    # ── Giriş / Kimlik ──────────────────────────────────────────
-    0x14: ('LOGIN_REQ',     'C→S',  'Kullanıcı adı + şifre/hash gönderimi [~]'),
-    0x15: ('LOGIN_ACK',     'S→C',  'Login yanıtı — başarı kodu + kullanıcı ID [~]'),
-    0x16: ('AUTH_TOKEN',    'C→S',  'Kimlik doğrulama token\'ı — oturum anahtarı [~]'),
-    0x17: ('USER_INFO',     'S→C',  'Kullanıcı bilgileri — seviye, deneyim, rütbe [~]'),
-    0x18: ('CHAR_SELECT',   'C→S',  'Karakter / slot seçimi [~]'),
-    # ── Lobi / Kanal ────────────────────────────────────────────
-    0x1e: ('LOBBY_LIST',    'S→C',  'Lobi / kanal listesi — kanal adları ve oyuncu sayıları [~]'),
-    0x1f: ('CHANNEL_JOIN',  'C→S',  'Kanala giriş isteği [~]'),
-    0x20: ('CHANNEL_ACK',   'S→C',  'Kanal giriş yanıtı — kabul/red kodu [~]'),
-    0x21: ('PLAYER_LIST',   'S→C',  'Kanaldaki oyuncu listesi — toplu oyuncu snapshot [~]'),
-    0x22: ('PLAYER_ENTER',  'S→C',  'Kanala yeni oyuncu girdi — oyuncu bilgisi [~]'),
-    0x23: ('PLAYER_LEAVE',  'S→C',  'Kanaldan oyuncu çıktı — oyuncu ID [~]'),
-    # ── Oda ─────────────────────────────────────────────────────
-    0x28: ('ROOM_LIST',     'S→C',  'Oda listesi — lobi odaları snapshot [~]'),
-    0x29: ('ROOM_CREATE',   'C→S',  'Oda oluşturma isteği — harita, mod, ayarlar [~]'),
-    0x2a: ('ROOM_JOIN',     'C→S',  'Odaya katılma isteği — oda ID + şifre [~]'),
-    0x2b: ('ROOM_LEAVE',    'C→S',  'Odadan ayrılma [~]'),
-    0x2c: ('ROOM_ACK',      'S→C',  'Oda işlemi yanıtı — oluşturma/katılma sonucu [~]'),
-    0x2d: ('ROOM_INFO',     'S→C',  'Oda bilgisi — harita, mod, oyuncular, ayarlar [~]'),
-    0x2e: ('ROOM_READY',    'C→S',  'Hazır butonu — oyuncu hazır/hazır değil toggle [~]'),
-    0x2f: ('ROOM_KICK',     'S→C',  'Odadan atıldı — neden kodu [~]'),
-    # ── Oyun / Tur ──────────────────────────────────────────────
-    0x32: ('GAME_START',    'S→C',  'Oyun başladı — harita ID, takım atamaları [~]'),
-    0x33: ('GAME_END',      'S→C',  'Oyun bitti — kazanan takım, skor tablosu [~]'),
-    0x34: ('ROUND_START',   'S→C',  'Tur başladı — süre ve takım bilgisi [~]'),
-    0x35: ('ROUND_END',     'S→C',  'Tur bitti — tur kazananı [~]'),
-    0x36: ('MAP_DATA',      'S→C',  'Harita verisi / spawn noktaları [~]'),
-    0x39: ('ROOM_SETTINGS', 'C→S',  'Oda ayarı değiştirme isteği — oda lideri gönderir [~]'),
-    # ── Oyuncu Konumu ve Durumu ──────────────────────────────────
-    0x3c: ('SPAWN',         'S→C',  'Spawn koordinatları — konum (x,y,z) + takım [~]'),
-    0x3d: ('MOVE',          'both', 'Hareket paketi — konum (x,y,z) + yaw açısı [~]'),
-    0x3e: ('JUMP',          'C→S',  'Zıplama [~]'),
-    0x3f: ('CROUCH',        'C→S',  'Çömelme / ayağa kalkma toggle [~]'),
-    0x40: ('STANCE',        'both', 'Duruş değişikliği / hareket durumu; login akışında 291 B olarak da görüldü (proto=0x0C) [~]'),
-    # ── Oyuncu genişletilmiş durum ──────────────────────────────
-    0x41: ('STANCE_EX',     'both', 'Duruş / hareket genişletilmiş — animasyon durumu [~]'),
-    0x42: ('DAMAGE_NOTIF',  'S→C',  'Hasar bildirimi — aldığı hasar miktarı [~]'),
-    0x43: ('BATCH_DATA',    'S→C',  'Toplu kanal/oda verisi — birden fazla alanı bir arada gönderir [~]'),
-    0x44: ('PLAYER_DATA',   'S→C',  'Oyuncu temel verisi — isim, seviye, takım [~]'),
-    0x45: ('CHAR_DATA',     'S→C',  'Karakter profil verisi — login sonrası S→C, 163 B (160 B payload) [✓]'),
-    # ── Silah / Savaş ───────────────────────────────────────────
-    0x46: ('SHOOT',         'C→S',  'Ateş paketi — silah ID ve hedef koordinatı [~]'),
-    0x47: ('HIT',           'S→C',  'Vurma bildirimi — saldıran ID, hedef ID, hasar, vurulan bölge; 35 B [✓]'),
-    0x48: ('ITEM_ACTION',   'C→S',  'Eşya kullanma / bırakma — eşya ID ve aksiyon kodu [~]'),
-    0x49: ('RELOAD',        'C→S',  'Şarjör doldurma [~]'),
-    0x4a: ('WEAPON_SWITCH', 'C→S',  'Silah değiştirme — silah slot ID [~]'),
-    0x4b: ('PLAYER_DEAD',   'S→C',  'Ölüm bildirimi — ölen ID, öldüren ID, silah kodu [~]'),
-    0x4c: ('CHAT',          'both', 'Sohbet mesajı; C→S olarak login akışında da gözlemlendi, 19 B [✓]'),
-    0x4d: ('SERVER_REDIR',  'S→C',  'Sunucu yönlendirme — oyun sunucusu IP + port [~]'),
-    0x4e: ('GRENADE',       'C→S',  'El bombası fırlatma — tip + başlangıç koordinatı [~]'),
-    0x4f: ('EXPLOSION',     'S→C',  'Patlama efekti — merkez koordinatı + yarıçap [~]'),
-    # ── Skor / İstatistik ───────────────────────────────────────
-    0x50: ('SCORE',         'S→C',  'Skor güncellemesi — takım A ve B puanı [~]'),
-    0x51: ('KILL_FEED',     'S→C',  'Kill/ölüm özeti — öldüren, ölen, silah [~]'),
-    0x52: ('STATS',         'S→C',  'Oyun sonu istatistikleri — tüm oyuncu skorları [~]'),
-    # ── Oyuncu / Takım Genişletilmiş ─────────────────────────────
-    0x53: ('MAP_INFO_EX',   'S→C',  'Harita genişletilmiş bilgi — ek harita parametreleri [~]'),
-    0x54: ('TEAM_INFO',     'S→C',  'Takım ataması / bilgisi — takım isimleri ve üyeler [~]'),
-    # ── DİKKAT: 0x55 ve 0x57 gerçek trafik verisiyle C→S doğrulandı ──
-    0x55: ('SESSION_REQ',   'C→S',  'Oturum isteği / istemci onay paketi — login akışında C→S, 19 B (16 B payload) [✓]'),
-    0x56: ('XP_UPDATE',     'S→C',  'Deneyim / seviye güncellemesi — yeni XP ve seviye [~]'),
-    0x57: ('DATA_ACK',      'C→S',  'Sunucu verisi onayı — login akışında C→S, 19 B (16 B payload) [✓]'),
-    0x58: ('SERVER_CFG',    'S→C',  'Sunucu yapılandırma / parametreler [~]'),
-    0x59: ('CHAT_CHANNEL',  'S→C',  'Sohbet kanalı bilgisi [~]'),
-    # ── Envanter / Mağaza ───────────────────────────────────────
-    0x5a: ('SHOP_BUY',      'C→S',  'Eşya / silah satın alma — ürün ID + miktar [~]'),
-    0x5b: ('SYSTEM_MSG',    'S→C',  'Sistem mesajı / duyuru — metin içerik [~]'),
-    0x5c: ('INVENTORY',     'S→C',  'Envanter listesi — sahip olunan eşyalar [~]'),
-    0x5d: ('EQUIP',         'C→S',  'Eşya donatma — slot + eşya ID [~]'),
-    0x5e: ('ROOM_STATE',    'S→C',  'Oda üye durumu güncellemesi — hazır/hazır değil [~]'),
-    0x5f: ('RANK_INFO',     'S→C',  'Rütbe / VIP bilgisi — mevcut rütbe ve puanı [~]'),
-    # ── Oyun İçi Geniş Veri ─────────────────────────────────────
-    0x62: ('PLAYER_STATS',  'S→C',  'Oyuncu istatistik paketi — K/D, isabet vs. [~]'),
-    0x63: ('KILL_STREAK',   'S→C',  'Kill serisi / combo bildirimi [~]'),
-    0x64: ('HEARTBEAT',     'both', 'Uygulama seviyesi canlı tutma — zaman damgası [~]'),
-    0x65: ('ACHIEVEMENT',   'S→C',  'Başarım / rozet verisi — yeni kazanılan [~]'),
-    0x68: ('WORLD_DATA',    'S→C',  'Oyun dünyası / harita event verisi [~]'),
-    0x69: ('OBJECTIVE',     'S→C',  'Hedef / görev bilgisi — bomba, bayrak konumu [~]'),
-    0x6a: ('LOBBY_INFO',    'S→C',  'Lobi / kanal toplu veri [~]'),
-    0x6b: ('ROOM_ENTER_ACK','S→C',  'Odaya giriş onayı — slot numarası [~]'),
-    0x6c: ('GAME_EVENT',    'S→C',  'Oyun içi olay — kapı, araç, nesne [~]'),
-    0x6d: ('POS_BATCH',     'S→C',  'Oyuncu konum toplu paketi — tüm oyuncuların konumu [~]'),
-    0x6e: ('SERVER_INFO',   'S→C',  'Sunucu bilgisi — IP, port, bölge kodu [~]'),
-    0x6f: ('SESSION_DATA',  'S→C',  'Oturum verisi — session token ve parametreler [~]'),
-    # ── Toplu Durum (büyük buffer'lardan sub-paket olarak gelir) ─
-    0x70: ('STATE_BATCH',   'S→C',  'Oyuncu durum toplu paketi — anlık snapshot [~]'),
-    0x71: ('MAP_OBJECTS',   'S→C',  'Harita nesneleri / pickup noktaları [~]'),
-    0x72: ('EQUIP_INFO',    'S→C',  'Donanım / ekipman bilgisi — silah ve zırh listesi [~]'),
-    0x73: ('GAME_RULES',    'S→C',  'Oyun kuralları / mod ayarları [~]'),
-    0x74: ('MISSION',       'S→C',  'Görev bilgisi / ilerleme yüzdesi [~]'),
-    0x75: ('VOTE',          'both', 'Oylama — kick, harita değişimi, oyun sonu [~]'),
-    0x77: ('PLAYER_ACTION', 'both', 'Oyuncu eylem paketi — animasyon/aksiyon kodu [~]'),
-    0x78: ('CLAN_INFO',     'S→C',  'Klan bilgisi — klan adı, üye sayısı, rütbe [~]'),
-    0x79: ('CLAN_RANK',     'S→C',  'Klan rütbe güncellemesi [~]'),
-    0x7a: ('BROADCAST',     'S→C',  'Sunucu yayını / duyurusu — sistem mesajı [~]'),
-    0x7b: ('FRIEND_LIST',   'S→C',  'Arkadaş listesi — login sonrası S→C; 91 B (88 B) veya 755 B (752 B, proto=0x0F) [✓]'),
-    0x7c: ('FRIEND_STATUS', 'S→C',  'Arkadaş çevrimiçi durum güncellemesi [~]'),
-    0x7d: ('SOCIAL_DATA',   'S→C',  'Sosyal / topluluk verisi — guild, arkadaş grubu [~]'),
-    0x7e: ('EVENT_BATCH',   'S→C',  'Oyun olay toplu paketi — sunucu akışı [~]'),
+
+    # ── 0x01–0x13 · Bağlantı / Oturum ─────────────────────────────────────────
+    0x01: ('CONNECT',        'C→S',  'İstemci bağlantı isteği — TCP kurulduktan sonra sunucuya ilk gönderilen paket [~]'),
+    0x02: ('PING',           'both', 'Canlı tutma ping — her iki yönde, 4 B timestamp payload [~]'),
+    0x03: ('PONG',           'both', 'Canlı tutma pong — PING yanıtı, 4 B timestamp [~]'),
+    0x04: ('DISCONNECT',     'both', 'Bağlantı kesme bildirimi — istemci veya sunucu tarafından [~]'),
+    0x05: ('HANDSHAKE',      'both', 'El sıkışma / kriptografi başlatma — BF oturum anahtarı müzakeresi [~]'),
+    0x06: ('SESSION_OK',     'S→C',  'Oturum onayı — sunucu bağlantıyı kabul etti, session ID döner [~]'),
+    0x07: ('RECONNECT',      'C→S',  'Yeniden bağlantı isteği — önceki session ID ile devam et [~]'),
+    0x08: ('ECHO',           'both', 'Bağlantı test echo — RTT / latency ölçümü [~]'),
+    0x09: ('VERSION',        'C→S',  'İstemci sürüm bilgisi — build no, patch sürümü [?]'),
+    0x0a: ('SERVER_LIST',    'S→C',  'Sunucu / bölge listesi — adres, yük, durum [?]'),
+    0x0b: ('SELECT_SERVER',  'C→S',  'Sunucu seçimi isteği — sunucu ID [?]'),
+    0x0c: ('NAT_INFO',       'both', 'NAT / harici IP bilgisi — P2P bağlantı kurulumunda kullanılır [?]'),
+    0x0e: ('SESSION_PING',   'both', 'Oturum seviyesi ping — kalp atışı, uzun inaktivite koruması [?]'),
+    0x0f: ('SESSION_CLOSE',  'both', 'Oturum kapatma talebi — graceful disconnect [?]'),
+    0x10: ('NOTICE',         'S→C',  'Sunucu bildirimi / duyuru — tek seferlik metin mesajı [?]'),
+    0x11: ('TIME_SYNC',      'both', 'Zaman senkronizasyonu — istemci / sunucu saat farkı [?]'),
+    0x12: ('ERROR_MSG',      'S→C',  'Hata bildirimi — hata kodu + açıklama string [?]'),
+    0x13: ('HEARTBEAT_ACK',  'S→C',  'Heartbeat onayı — sunucu canlılık yanıtı [?]'),
+
+    # ── 0x14–0x1d · Giriş / Kimlik Doğrulama ──────────────────────────────────
+    0x14: ('LOGIN_REQ',      'C→S',  'Login isteği — Pascal-string kullanıcı adı + MD5/SHA1 şifre hash [~]'),
+    0x15: ('LOGIN_ACK',      'S→C',  'Login yanıtı — 1 B sonuç kodu (0=OK, 1=yanlış şifre, …) + 4 B kullanıcı ID [~]'),
+    0x16: ('AUTH_TOKEN',     'C→S',  'Kimlik doğrulama token — session token / MAC challenge yanıtı [~]'),
+    0x17: ('USER_INFO',      'S→C',  'Kullanıcı profil verisi — seviye, deneyim, rütbe, VIP durumu [~]'),
+    0x18: ('CHAR_SELECT',    'C→S',  'Karakter / görünüm seçimi — slot ID [~]'),
+    0x19: ('CHAR_LIST',      'S→C',  'Karakter listesi — mevcut görünüm/slot verileri [?]'),
+    0x1a: ('CHAR_CREATE',    'C→S',  'Yeni karakter oluşturma — isim + görünüm seçimi [?]'),
+    0x1b: ('CHAR_CREATE_ACK','S→C',  'Karakter oluşturma yanıtı — sonuç kodu [?]'),
+    0x1c: ('CHAR_DELETE',    'C→S',  'Karakter silme isteği — slot ID [?]'),
+    0x1d: ('CHAR_DELETE_ACK','S→C',  'Karakter silme yanıtı — sonuç kodu [?]'),
+
+    # ── 0x1e–0x27 · Lobi / Kanal ───────────────────────────────────────────────
+    0x1e: ('LOBBY_LIST',     'S→C',  'Lobi / kanal listesi — kanal adları, oyuncu sayıları, kapasite [~]'),
+    0x1f: ('CHANNEL_JOIN',   'C→S',  'Kanala giriş isteği — kanal ID [~]'),
+    0x20: ('CHANNEL_ACK',    'S→C',  'Kanal giriş yanıtı — kabul/red kodu [~]'),
+    0x21: ('PLAYER_LIST',    'S→C',  'Kanaldaki oyuncu listesi — toplu snapshot [~]'),
+    0x22: ('PLAYER_ENTER',   'S→C',  'Kanala yeni oyuncu girdi — oyuncu adı, seviye, rütbe [~]'),
+    0x23: ('PLAYER_LEAVE',   'S→C',  'Kanaldan oyuncu ayrıldı — oyuncu ID [~]'),
+    0x24: ('CHANNEL_INFO',   'S→C',  'Kanal detay verisi — moderatör, kural, açıklama [?]'),
+    0x25: ('CHANNEL_CHAT',   'both', 'Kanal sohbet mesajı — gönderen + metin [?]'),
+    0x26: ('PLAYER_UPDATE',  'S→C',  'Oyuncu bilgisi güncellendi — seviye veya rütbe değişimi [?]'),
+    0x27: ('CHANNEL_LEAVE',  'C→S',  'Kanaldan çıkış — lobi bekleme ekranına dön [?]'),
+
+    # ── 0x28–0x3b · Oda ────────────────────────────────────────────────────────
+    0x28: ('ROOM_LIST',      'S→C',  'Oda listesi — lobi odaları snapshot [~]'),
+    0x29: ('ROOM_CREATE',    'C→S',  'Oda oluşturma isteği — harita, mod, şifre, maksimum oyuncu [~]'),
+    0x2a: ('ROOM_JOIN',      'C→S',  'Odaya katılma isteği — oda ID + şifre [~]'),
+    0x2b: ('ROOM_LEAVE',     'C→S',  'Odadan ayrılma [~]'),
+    0x2c: ('ROOM_ACK',       'S→C',  'Oda işlemi yanıtı — oluşturma / katılma sonuç kodu [~]'),
+    0x2d: ('ROOM_INFO',      'S→C',  'Oda bilgisi paketi — harita, mod, lider, oyuncu listesi, ayarlar [~]'),
+    0x2e: ('ROOM_READY',     'C→S',  'Hazır butonu — hazır / hazır değil toggle [~]'),
+    0x2f: ('ROOM_KICK',      'S→C',  'Odadan atılma bildirimi — neden kodu (kick / oda kapandı) [~]'),
+    0x30: ('ROOM_LEAD_CHG',  'S→C',  'Oda liderliği değişti — yeni lider oyuncu ID [?]'),
+    0x31: ('ROOM_PLAYER_LIST','S→C', 'Oda oyuncu listesi snapshotu — tüm slotlar, hazır durumları [?]'),
+    0x32: ('GAME_START',     'S→C',  'Oyun başlıyor — harita ID, oyun modu, takım atamaları [~]'),
+    0x33: ('GAME_END',       'S→C',  'Oyun bitti — kazanan takım + skor tablosu [~]'),
+    0x34: ('ROUND_START',    'S→C',  'Tur başladı — kalan süre, takım bilgisi [~]'),
+    0x35: ('ROUND_END',      'S→C',  'Tur bitti — tur kazananı, puan [~]'),
+    0x36: ('MAP_DATA',       'S→C',  'Harita verisi — spawn noktaları, sınırlar, nesne pozisyonları [~]'),
+    0x37: ('GAME_TIMER',     'S→C',  'Oyun sayacı — kalan süre güncellemesi (geri sayım) [?]'),
+    0x38: ('SPECTATE',       'both', 'İzleyici (spectator) modu — istek / onay / geçiş bildirimi [?]'),
+    0x39: ('ROOM_SETTINGS',  'C→S',  'Oda ayarı değiştirme — oda lideri gönderir: harita, mod, süre [~]'),
+    0x3a: ('MAP_CHANGE',     'both', 'Harita değişim isteği / sonucu — oyun sonu veya lider komutu [?]'),
+    0x3b: ('GAME_INIT',      'S→C',  'Oyun başlamadan önce gönderilen init paketi — kaynak, kural seti [?]'),
+
+    # ── 0x3c–0x4f · Oyuncu Konumu / Savaş ─────────────────────────────────────
+    0x3c: ('SPAWN',          'S→C',  'Spawn noktası — konum (x,y,z float LE) + takım byte; 15 B payload [~]'),
+    0x3d: ('MOVE',           'both', 'Hareket paketi — konum (x,y,z float LE) + yaw u16; min 14 B [~]'),
+    0x3e: ('JUMP',           'C→S',  'Zıplama bildirimi — atış anındaki konum veya sadece flag [~]'),
+    0x3f: ('CROUCH',         'C→S',  'Çömelme / ayağa kalkma toggle [~]'),
+    0x40: ('STANCE',         'both', 'Duruş / hareket durumu paketi — animasyon kodu; login akışında 291 B (proto=0x0C) [✓]'),
+    0x41: ('STANCE_EX',      'both', 'Genişletilmiş duruş verisi — ek animasyon, yükleme durumu [~]'),
+    0x42: ('DAMAGE_NOTIF',   'S→C',  'Hasar bildirimi — aldığı hasar miktarı, kalan HP [~]'),
+    0x43: ('BATCH_DATA',     'S→C',  'Toplu veri çerçevesi — birden fazla alt paketi tek buffer\'da taşır [~]'),
+    0x44: ('PLAYER_DATA',    'S→C',  'Oyuncu temel verisi — isim, seviye, takım ID [~]'),
+    0x45: ('CHAR_DATA',      'S→C',  'Karakter profil verisi — login sonrası S→C; 163 B toplam, 160 B payload; [0:4]=oyuncu_id? [✓]'),
+    0x46: ('SHOOT',          'C→S',  'Ateş paketi — silah slot ID + hedef koordinatı (x,y,z) [~]'),
+    0x47: ('HIT',            'S→C',  'Vurma bildirimi — [0:2]=alan_A [2:4]=alan_B [4:6]=hasar/alan_C; 35 B (32 B payload); login akışında alan anlamı farklı [✓]'),
+    0x48: ('ITEM_ACTION',    'C→S',  'Eşya kullanma / bırakma — eşya slot ID + aksiyon kodu [~]'),
+    0x49: ('RELOAD',         'C→S',  'Şarjör doldurma bildirimi — silah slot ID [~]'),
+    0x4a: ('WEAPON_SWITCH',  'C→S',  'Silah değiştirme — yeni silah slot ID [~]'),
+    0x4b: ('PLAYER_DEAD',    'S→C',  'Ölüm bildirimi — [0:2]=öldüren_ID [2:4]=ölen_ID [4]=silah_kodu [~]'),
+    0x4c: ('CHAT',           'both', 'Sohbet mesajı — Pascal-string gönderen + metin; login akışında 19 B (16 B payload) binary token [✓]'),
+    0x4d: ('SERVER_REDIR',   'S→C',  'Sunucu yönlendirme — oyun sunucusu IPv4 (4 B) + port (2 B LE) [~]'),
+    0x4e: ('GRENADE',        'C→S',  'El bombası fırlatma — bomba tipi + başlangıç koordinatı (x,y,z) [~]'),
+    0x4f: ('EXPLOSION',      'S→C',  'Patlama efekti bildirimi — merkez koordinatı + yarıçap + hasar tipi [~]'),
+
+    # ── 0x50–0x61 · Skor / Envanter / Mağaza ──────────────────────────────────
+    0x50: ('SCORE',          'S→C',  'Skor güncellemesi — [0:2]=takım_A [2:4]=takım_B puan (u16 LE) [~]'),
+    0x51: ('KILL_FEED',      'S→C',  'Kill özeti — öldüren ID + ölen ID + silah kodu [~]'),
+    0x52: ('STATS',          'S→C',  'Oyun sonu istatistikleri — tüm oyuncuların skor tablosu [~]'),
+    0x53: ('MAP_INFO_EX',    'S→C',  'Harita genişletilmiş bilgi — çevresel parametreler, ek spawn [~]'),
+    0x54: ('TEAM_INFO',      'S→C',  'Takım atama / bilgisi — üye listesi, renk, isim [~]'),
+    # UYARI: 0x55 ve 0x57 — gerçek trafik verisiyle C→S doğrulandı (19 B, 16 B payload) ──
+    0x55: ('SESSION_REQ',    'C→S',  'Oturum isteği / istemci onay token — login akışında C→S; 19 B toplam, 16 B payload; [0:4]=token_id? [✓]'),
+    0x56: ('XP_UPDATE',      'S→C',  'Deneyim / seviye güncellemesi — yeni XP (u32) + yeni seviye (u16) [~]'),
+    0x57: ('DATA_ACK',       'C→S',  'Sunucu verisi onayı / ikinci token paketi — login akışında C→S; 19 B toplam, 16 B payload [✓]'),
+    0x58: ('SERVER_CFG',     'S→C',  'Sunucu yapılandırma parametreleri — max oyuncu, mod kısıtlamaları [~]'),
+    0x59: ('CHAT_CHANNEL',   'S→C',  'Sohbet kanalı bilgisi / başlatma — kanal ID, mod [~]'),
+    0x5a: ('SHOP_BUY',       'C→S',  'Satın alma isteği — ürün ID + miktar + para birimi tipi [~]'),
+    0x5b: ('SYSTEM_MSG',     'S→C',  'Sistem mesajı / sunucu duyurusu — Pascal-string metin [~]'),
+    0x5c: ('INVENTORY',      'S→C',  'Envanter listesi — sahip olunan silah, zırh, eşya verileri [~]'),
+    0x5d: ('EQUIP',          'C→S',  'Eşya / silah donatma — ekipman slot ID + eşya ID [~]'),
+    0x5e: ('ROOM_STATE',     'S→C',  'Oda üye durum güncellemesi — oyuncu ID + hazır/değil bayrağı [~]'),
+    0x5f: ('RANK_INFO',      'S→C',  'Rütbe / VIP bilgisi — mevcut rütbe ID + puan + sonraki eşik [~]'),
+    0x60: ('SHOP_INFO',      'S→C',  'Mağaza katalogu / öne çıkan ürünler — ürün ID listesi [?]'),
+    0x61: ('PURCHASE_ACK',   'S→C',  'Satın alma sonucu — sonuç kodu + yeni bakiye [?]'),
+
+    # ── 0x62–0x6f · Oyun İçi Genişletilmiş Veri ─────────────────────────────
+    0x62: ('PLAYER_STATS',   'S→C',  'Oyuncu istatistik paketi — K/D oranı, isabet yüzdesi, toplam kill [~]'),
+    0x63: ('KILL_STREAK',    'S→C',  'Kill serisi / combo bildirimi — seri sayısı + ödül tipi [~]'),
+    0x64: ('HEARTBEAT',      'both', 'Uygulama seviyesi kalp atışı — 4 B zaman damgası [~]'),
+    0x65: ('ACHIEVEMENT',    'S→C',  'Başarım / rozet kazanıldı — başarım ID + açıklama [~]'),
+    0x66: ('DAILY_MISSION',  'S→C',  'Günlük görev verisi — görev listesi + ilerleme yüzdeleri [?]'),
+    0x67: ('BADGE_UNLOCK',   'S→C',  'Yeni rozet açıldı — rozet ID + tooltip metni [?]'),
+    0x68: ('WORLD_DATA',     'S→C',  'Oyun dünyası / dinamik harita olayları — kapı, araç, tetikleyici [~]'),
+    0x69: ('OBJECTIVE',      'S→C',  'Hedef bilgisi — bomba / bayrak konumu, sayaç, durum [~]'),
+    0x6a: ('LOBBY_INFO',     'S→C',  'Lobi toplu veri paketi — kanal + oda listeleri birleşik [~]'),
+    0x6b: ('ROOM_ENTER_ACK', 'S→C',  'Odaya giriş onayı — oyuncu slot numarası [~]'),
+    0x6c: ('GAME_EVENT',     'S→C',  'Oyun içi olay bildirimi — kapı açıldı, araç binildi, nesne alındı [~]'),
+    0x6d: ('POS_BATCH',      'S→C',  'Toplu konum paketi — tüm oyuncuların (x,y,z) konumları [~]'),
+    0x6e: ('SERVER_INFO',    'S→C',  'Sunucu bilgisi — IPv4 (4 B) + port (2 B LE) + bölge kodu [~]'),
+    0x6f: ('SESSION_DATA',   'S→C',  'Oturum verisi — session token + parametre seti [~]'),
+
+    # ── 0x70–0x7f · Toplu Durum / Sosyal ─────────────────────────────────────
+    # Not: büyük buffer'lar (>258 B) _walk_subpackets ile sub-paket olarak ayrıştırılır
+    0x70: ('STATE_BATCH',    'S→C',  'Oyuncu durum toplu paketi — anlık snapshot; alt paket olarak gelir [~]'),
+    0x71: ('MAP_OBJECTS',    'S→C',  'Harita nesne listesi — pickup, silah, bomba spawn noktaları [~]'),
+    0x72: ('EQUIP_INFO',     'S→C',  'Ekipman bilgisi — oyuncunun donanımlı silah + zırh listesi [~]'),
+    0x73: ('GAME_RULES',     'S→C',  'Oyun kuralları / mod ayarları — FF, sınır süre, puan hedefi [~]'),
+    0x74: ('MISSION',        'S→C',  'Görev bilgisi / ilerleme — aktif görev ID + yüzde [~]'),
+    0x75: ('VOTE',           'both', 'Oylama — kick vote, harita değişimi, erken bitiş [~]'),
+    0x76: ('NOTICE_BOARD',   'S→C',  'Sunucu ilan panosu / scroll duyurusu — zaman damgalı metin [?]'),
+    0x77: ('PLAYER_ACTION',  'both', 'Oyuncu eylem paketi — animasyon / aksiyon kodu (iyileştirme, eğil, vs.) [~]'),
+    0x78: ('CLAN_INFO',      'S→C',  'Klan bilgisi — klan adı, üye sayısı, sembol ID, rütbe [~]'),
+    0x79: ('CLAN_RANK',      'S→C',  'Klan rütbe / puan güncellemesi [~]'),
+    0x7a: ('BROADCAST',      'S→C',  'Sunucu geniş yayın duyurusu — tüm kanallara giden sistem mesajı [~]'),
+    0x7b: ('FRIEND_LIST',    'S→C',  'Arkadaş listesi — login sonrası S→C; 91 B (88 B payload) kısa veya 755 B (752 B, proto=0x0F) uzun; [0:2]=giriş_sayısı? [✓]'),
+    0x7c: ('FRIEND_STATUS',  'S→C',  'Arkadaş çevrimiçi durum güncellemesi — arkadaş ID + durum kodu [~]'),
+    0x7d: ('SOCIAL_DATA',    'S→C',  'Sosyal / topluluk verisi — guild, arkadaş grubu, davet listesi [~]'),
+    0x7e: ('EVENT_BATCH',    'S→C',  'Oyun olay toplu paketi — sunucu tarafından gruplanmış olaylar [~]'),
+    0x7f: ('CHANNEL_UPDATE', 'S→C',  'Kanal durumu toplu güncellemesi — oyuncu sayısı değişimi [?]'),
+
+    # ── 0x80–0x8f · Genişletilmiş Özellikler ─────────────────────────────────
+    0x80: ('SHOP_CATALOG',   'S→C',  'Mağaza tam katalogu — tüm ürünler, fiyatlar, süre seçenekleri [?]'),
+    0x81: ('ITEM_EXPIRE',    'S→C',  'Eşya süresi doldu bildirimi — eşya ID + kalan süre [?]'),
+    0x82: ('CLAN_INVITE',    'both', 'Klan daveti — gönderen klan ID + davet edilen oyuncu [?]'),
+    0x83: ('FRIEND_REQ',     'both', 'Arkadaşlık isteği — gönderen oyuncu ID + isim [?]'),
+    0x84: ('FRIEND_ACK',     'both', 'Arkadaşlık isteği yanıtı — kabul / red [?]'),
+    0x85: ('PRIVATE_MSG',    'both', 'Özel mesaj (whisper) — alıcı ID + metin [?]'),
+    0x86: ('BLOCK_LIST',     'S→C',  'Engellenen oyuncular listesi [?]'),
+    0x87: ('REPORT_ACK',     'S→C',  'Şikâyet / rapor sonucu — işlem kodu [?]'),
+    0x88: ('HOTKEY_SYNC',    'C→S',  'İstemci kısayol / ayar senkronizasyonu [?]'),
+    0x89: ('ROOM_PASS_CHG',  'C→S',  'Oda şifresi değiştirme isteği — yeni şifre string [?]'),
+    0x8a: ('TEAM_BALANCE',   'S→C',  'Takım dengeleme bildirimi — yeni takım atamaları [?]'),
+    0x8b: ('GAME_PAUSE',     'both', 'Oyun duraklatma / devam — nedeni + zaman damgası [?]'),
+    0x8c: ('ANTI_CHEAT',     'C→S',  'Anti-hile veri paketi — VMProtect / oyun bütünlük verisi [?]'),
+    0x8d: ('PERM_UPDATE',    'S→C',  'Hesap izin / kısıtlama güncellemesi — ban bilgisi [?]'),
+    0x8e: ('CHANNEL_PASS',   'C→S',  'Kanala şifreli giriş — VIP kanal şifresi [?]'),
+    0x8f: ('EVENT_NOTIF',    'S→C',  'Sunucu etkinliği bildirimi — özel mod başladı / bitti [?]'),
 }
 
 # Geçerli proto byte değerleri (PointBlank varyantı):
@@ -476,149 +529,380 @@ _VALID_PROTO: frozenset[int] = frozenset({0x0C, 0x0D, 0x0F})
 def _ascii_safe(b: bytes) -> str:
     return ''.join(chr(x) if 0x20 <= x < 0x7f else '.' for x in b)
 
-def _try_string(data: bytes, offset: int) -> tuple[str, int]:
-    """[1B len][bytes] Pascal string okur; geçersizse hex döndürür."""
-    if offset >= len(data): return '', offset
-    slen = data[offset]; offset += 1
-    raw = data[offset:offset + slen]
-    try:   text = raw.decode('utf-8', errors='replace')
-    except Exception: text = raw.hex()
-    return text, offset + slen
+def _try_string(data: bytes, offset: int) -> tuple[str | None, int]:
+    """[1B len][bytes] Pascal string okur.
+
+    Başarılı → (metin, yeni_offset)
+    Başarısız → (None, orijinal_offset)  — çağıran hex dump'a düşer.
+
+    Başarısızlık koşulları:
+      • slen == 0 veya slen > 64  (makul kullanıcı adı / mesaj uzunluğu dışı)
+      • buffer'dan taşıyor
+      • baskılanamaz karakter oranı > %25 (ikili / şifreli veri belirtisi)
+    """
+    if offset >= len(data):
+        return None, offset
+    slen = data[offset]
+    # slen=0: boş string — bu protokolde boş alan başlığı genellikle binary header
+    # belirtisidir; None dönderek çağıranın hex fallback'e düşmesini sağla.
+    if slen == 0:
+        return None, offset
+    end = offset + 1 + slen
+    if end > len(data):                       # buffer'dan taşıyor → kesinlikle çöp
+        return None, offset
+    raw = data[offset + 1 : end]
+    try:
+        text = raw.decode('utf-8', errors='replace')
+    except Exception:
+        return None, offset
+    # Baskılanamaz veya replacement-char (U+FFFD) oranı >%25 ise ikili / şifreli veri.
+    # Not: slen > 64 hard limit kaldırıldı — uzun chat mesajları geçerli olabilir;
+    # gerçek koruma printability check'tedir (ikili veri %75'in altında kalır).
+    printable = sum(1 for c in text if c.isprintable() and c != '\ufffd')
+    if printable / len(text) < 0.75:         # len(text)==slen>0 burada garantili
+        return None, offset
+    return text, end
 
 def _decode_fields(opcode_byte: int, payload: bytes, direction: str) -> list[dict]:
-    """Opcode'a göre payload alanlarını ayrıştır. Bilinmeyen → hex dump."""
+    """Opcode'a göre payload alanlarını ayrıştır. Bilinmeyen → sadece hex dump."""
     fields: list[dict] = []
 
     def f(name, value, kind='val'):
         fields.append({'n': name, 'v': str(value), 'k': kind})
 
+    # Oyun modu adları (GAME_START / MAP_CHANGE vs. için ortak tablo)
+    _GAME_MODES = {
+        0x00: 'Deathmatch',
+        0x01: 'Team Deathmatch',
+        0x02: 'Bomba Modu',
+        0x03: 'Bayrak Yarışı (CTF)',
+        0x04: 'Survival',
+        0x05: 'Keskin Nişancı',
+        0x06: 'Zombi Modu',
+        0x07: 'AI / Bot Modu',
+    }
+
+    # Silah kodu → isim (PLAYER_DEAD / KILL_FEED için)
+    _WEAPONS = {
+        0x00: 'Bilinmiyor/Çevre',
+        0x01: 'Tabanca',
+        0x02: 'Pompalı Tüfek',
+        0x03: 'SMG',
+        0x04: 'Tüfek (Rifle)',
+        0x05: 'Keskin Nişancı Tüfeği',
+        0x06: 'Makineli Tüfek',
+        0x07: 'El Bombası',
+        0x08: 'RPG / Roket',
+        0x09: 'Bıçak',
+        0x0a: 'C4 / Bomba',
+        0x0b: 'Özel Silah',
+    }
+
+    # Login ACK sonuç kodları
+    _LOGIN_RESULTS = {
+        0x00: 'Başarılı',
+        0x01: 'Hatalı şifre',
+        0x02: 'Hesap bulunamadı',
+        0x03: 'Zaten giriş yapıldı',
+        0x04: 'Sunucu dolu',
+        0x05: 'Hesap askıya alındı (ban)',
+        0x06: 'Bakım / sunucu kapalı',
+        0x07: 'Coğrafi kısıtlama',
+        0x08: 'Yaş kısıtlaması',
+        0x09: 'İstemci sürümü eski',
+        0x0a: 'Güvenlik doğrulama hatası',
+    }
+
     try:
-        if opcode_byte == 0x02 and len(payload) >= 4:   # PING
-            f('Timestamp', struct.unpack_from('<I', payload)[0], 'u32')
+        # ── 0x02 PING / 0x03 PONG ────────────────────────────────────────────
+        if opcode_byte in (0x02, 0x03) and len(payload) >= 4:
+            ts = struct.unpack_from('<I', payload)[0]
+            f('Timestamp (u32 LE)', ts, 'u32')
 
-        elif opcode_byte == 0x14 and len(payload) >= 1:  # LOGIN_REQ
-            uname, off = _try_string(payload, 0)
-            f('Kullanıcı adı', uname, 'str')
-            if off < len(payload):
-                f('Şifre/Hash', payload[off:off+32].hex(), 'hex')
-
-        elif opcode_byte == 0x15 and len(payload) >= 1:  # LOGIN_ACK
+        # ── 0x04 DISCONNECT ───────────────────────────────────────────────────
+        elif opcode_byte == 0x04 and len(payload) >= 1:
             code = payload[0]
-            names = {0: 'Başarılı', 1: 'Hatalı şifre', 2: 'Hesap yok',
-                     3: 'Zaten giriş yapıldı', 4: 'Sunucu dolu'}
-            f('Sonuç', f"0x{code:02x} — {names.get(code, 'Bilinmiyor')}", 'status')
-            if len(payload) >= 5:
-                uid = struct.unpack_from('<I', payload, 1)[0]
-                f('Kullanıcı ID', uid, 'u32')
+            reasons = {0:'Normal', 1:'Zaman aşımı', 2:'Kick', 3:'Sunucu bakımı'}
+            f('Neden', f"0x{code:02x} — {reasons.get(code, 'Bilinmiyor')}", 'status')
 
-        elif opcode_byte == 0x3d and len(payload) >= 12: # MOVE
+        # ── 0x06 SESSION_OK ───────────────────────────────────────────────────
+        elif opcode_byte == 0x06 and len(payload) >= 4:
+            sid = struct.unpack_from('<I', payload)[0]
+            f('Session ID', f'0x{sid:08x}', 'hex')
+
+        # ── 0x14 LOGIN_REQ ────────────────────────────────────────────────────
+        elif opcode_byte == 0x14 and len(payload) >= 1:
+            uname, off = _try_string(payload, 0)
+            if uname is not None:
+                f('Kullanıcı adı', uname, 'str')
+                if off < len(payload):
+                    hash_bytes = payload[off:off+32]
+                    f('Şifre hash (hex)', hash_bytes.hex(), 'hex')
+                    if off + 32 < len(payload):
+                        f('Ek veri (hex)', payload[off+32:].hex(), 'hex')
+            else:
+                # Pascal string okunamadı → tüm payload'ı ham hex olarak göster
+                f('Payload (ham hex — format belirsiz)', payload[:80].hex(), 'hex')
+
+        # ── 0x15 LOGIN_ACK ────────────────────────────────────────────────────
+        elif opcode_byte == 0x15 and len(payload) >= 1:
+            code = payload[0]
+            f('Sonuç', f"0x{code:02x} — {_LOGIN_RESULTS.get(code, 'Bilinmiyor')}", 'status')
+            if code == 0x00:
+                if len(payload) >= 5:
+                    uid = struct.unpack_from('<I', payload, 1)[0]
+                    f('Kullanıcı ID (u32)', uid, 'u32')
+                if len(payload) >= 7:
+                    level = struct.unpack_from('<H', payload, 5)[0]
+                    f('Seviye', level, 'u16')
+
+        # ── 0x17 USER_INFO ────────────────────────────────────────────────────
+        elif opcode_byte == 0x17 and len(payload) >= 4:
+            uid = struct.unpack_from('<I', payload, 0)[0]
+            f('Kullanıcı ID', uid, 'u32')
+            if len(payload) >= 6:
+                level = struct.unpack_from('<H', payload, 4)[0]
+                f('Seviye', level, 'u16')
+            if len(payload) >= 10:
+                xp = struct.unpack_from('<I', payload, 6)[0]
+                f('Deneyim (XP)', xp, 'u32')
+
+        # ── 0x32 GAME_START ───────────────────────────────────────────────────
+        elif opcode_byte == 0x32 and len(payload) >= 2:
+            map_id = struct.unpack_from('<H', payload, 0)[0]
+            f('Harita ID', f'{map_id} (0x{map_id:04x})', 'u16')
+            if len(payload) >= 3:
+                mode = payload[2]
+                f('Oyun modu', f"0x{mode:02x} — {_GAME_MODES.get(mode, 'Bilinmiyor')}", 'val')
+            if len(payload) >= 4:
+                teams = payload[3]
+                f('Takım sayısı', teams, 'u32')
+
+        # ── 0x33 GAME_END ─────────────────────────────────────────────────────
+        elif opcode_byte == 0x33 and len(payload) >= 1:
+            winner = payload[0]
+            f('Kazanan takım', 'Mavi' if winner == 0 else ('Kırmızı' if winner == 1 else f'0x{winner:02x}'), 'val')
+            if len(payload) >= 5:
+                score_a = struct.unpack_from('<H', payload, 1)[0]
+                score_b = struct.unpack_from('<H', payload, 3)[0]
+                f('Takım A skoru', score_a, 'u16')
+                f('Takım B skoru', score_b, 'u16')
+
+        # ── 0x3c SPAWN ────────────────────────────────────────────────────────
+        elif opcode_byte == 0x3c and len(payload) >= 12:
+            x, y, z = struct.unpack_from('<fff', payload, 0)
+            f('Spawn X', f'{x:.2f}', 'float')
+            f('Spawn Y', f'{y:.2f}', 'float')
+            f('Spawn Z', f'{z:.2f}', 'float')
+            if len(payload) >= 13:
+                team = payload[12]
+                f('Takım', 'Mavi (0)' if team == 0 else (f'Kırmızı (1)' if team == 1 else f'0x{team:02x}'), 'val')
+            if len(payload) >= 14:
+                f('Spawn flag@13', f'0x{payload[13]:02x}', 'hex')
+
+        # ── 0x3d MOVE ─────────────────────────────────────────────────────────
+        elif opcode_byte == 0x3d and len(payload) >= 12:
             x, y, z = struct.unpack_from('<fff', payload, 0)
             f('X', f'{x:.3f}', 'float')
             f('Y', f'{y:.3f}', 'float')
             f('Z', f'{z:.3f}', 'float')
             if len(payload) >= 14:
-                yaw   = struct.unpack_from('<H', payload, 12)[0]
-                f('Yaw (açı)', f'{yaw} ({yaw/65535*360:.1f}°)', 'u16')
+                yaw = struct.unpack_from('<H', payload, 12)[0]
+                f('Yaw açısı', f'{yaw} ({yaw / 65535 * 360:.1f}°)', 'u16')
+            if len(payload) >= 15:
+                flags = payload[14]
+                f('Hareket bayrakları@14', f'0x{flags:02x}', 'hex')
 
-        elif opcode_byte == 0x45 and len(payload) >= 4:  # CHAR_DATA — 160 B login payload
-            # Binary struct; gerçek alan düzeni bilinmiyor.
-            # İlk u32: büyük olasılıkla oyuncu/oturum ID'si.
+        # ── 0x3e JUMP ─────────────────────────────────────────────────────────
+        elif opcode_byte == 0x3e and len(payload) >= 12:
+            x, y, z = struct.unpack_from('<fff', payload, 0)
+            f('Konum X', f'{x:.2f}', 'float')
+            f('Konum Y', f'{y:.2f}', 'float')
+            f('Konum Z', f'{z:.2f}', 'float')
+
+        # ── 0x40 STANCE (büyük binary; login akışında 288 B payload) ─────────
+        elif opcode_byte == 0x40 and len(payload) >= 4:
             maybe_id = struct.unpack_from('<I', payload, 0)[0]
-            f('Olası oyuncu ID (u32@0)', f'0x{maybe_id:08x}', 'hex')
+            f('Alan@0 (u32, olası oyuncu ID)', f'0x{maybe_id:08x}', 'hex')
             f('Payload boyutu', len(payload), 'u32')
+            if len(payload) >= 8:
+                second = struct.unpack_from('<I', payload, 4)[0]
+                f('Alan@4 (u32)', f'0x{second:08x}', 'hex')
 
-        elif opcode_byte == 0x47 and len(payload) >= 6:  # HIT — 32 B; login fazında alan anlamı belirsiz
-            # Uyarı: bu decoder oyun içi HIT semantiği varsayar.
-            # Login fazında (35 B buffer) alanlar farklı anlam taşıyabilir.
-            attacker = struct.unpack_from('<H', payload, 0)[0]
-            victim   = struct.unpack_from('<H', payload, 2)[0]
-            damage   = struct.unpack_from('<H', payload, 4)[0]
-            f('Alan@0 (u16)', f'0x{attacker:04x}', 'hex')
-            f('Alan@2 (u16)', f'0x{victim:04x}',   'hex')
-            f('Alan@4 (u16)', f'0x{damage:04x}',   'hex')
+        # ── 0x42 DAMAGE_NOTIF ─────────────────────────────────────────────────
+        elif opcode_byte == 0x42 and len(payload) >= 4:
+            damage = struct.unpack_from('<H', payload, 0)[0]
+            hp_rem = struct.unpack_from('<H', payload, 2)[0]
+            f('Hasar miktarı', damage, 'u16')
+            f('Kalan HP', hp_rem, 'u16')
+
+        # ── 0x45 CHAR_DATA (160 B payload) ───────────────────────────────────
+        elif opcode_byte == 0x45 and len(payload) >= 4:
+            # İlk u32: büyük olasılıkla oyuncu/session ID
+            maybe_id = struct.unpack_from('<I', payload, 0)[0]
+            f('Alan@0 (u32, olası oyuncu ID)', f'0x{maybe_id:08x}', 'hex')
+            f('Payload boyutu', len(payload), 'u32')
+            if len(payload) >= 8:
+                second = struct.unpack_from('<I', payload, 4)[0]
+                f('Alan@4 (u32)', f'0x{second:08x}', 'hex')
+
+        # ── 0x46 SHOOT ────────────────────────────────────────────────────────
+        elif opcode_byte == 0x46 and len(payload) >= 1:
+            slot = payload[0]
+            f('Silah slot', f'0x{slot:02x}', 'hex')
+            if len(payload) >= 13:
+                x, y, z = struct.unpack_from('<fff', payload, 1)
+                f('Hedef X', f'{x:.2f}', 'float')
+                f('Hedef Y', f'{y:.2f}', 'float')
+                f('Hedef Z', f'{z:.2f}', 'float')
+
+        # ── 0x47 HIT (32 B payload) ───────────────────────────────────────────
+        elif opcode_byte == 0x47 and len(payload) >= 6:
+            # Uyarı: oyun içi HIT semantiği varsayılıyor.
+            # Login fazında (35 B buffer) alan anlamları farklı olabilir.
+            v0 = struct.unpack_from('<H', payload, 0)[0]
+            v2 = struct.unpack_from('<H', payload, 2)[0]
+            v4 = struct.unpack_from('<H', payload, 4)[0]
+            f('Alan@0 (u16)', f'0x{v0:04x} ({v0})', 'hex')
+            f('Alan@2 (u16)', f'0x{v2:04x} ({v2})', 'hex')
+            f('Alan@4 (u16, olası hasar)', f'0x{v4:04x} ({v4})', 'hex')
             if len(payload) >= 7:
                 zone = payload[6]
-                f('Alan@6 (u8)', f'0x{zone:02x}', 'hex')
+                f('Alan@6 (u8, olası vurulan bölge)', f'0x{zone:02x}', 'hex')
 
-        elif opcode_byte == 0x4b and len(payload) >= 4:  # PLAYER_DEAD
+        # ── 0x4b PLAYER_DEAD ─────────────────────────────────────────────────
+        elif opcode_byte == 0x4b and len(payload) >= 4:
             killer = struct.unpack_from('<H', payload, 0)[0]
             victim = struct.unpack_from('<H', payload, 2)[0]
-            f('Öldüren ID', killer, 'u16')
-            f('Ölen ID',    victim, 'u16')
+            f('Öldüren oyuncu ID', f'{killer} (0x{killer:04x})', 'u16')
+            f('Ölen oyuncu ID',    f'{victim} (0x{victim:04x})', 'u16')
             if len(payload) >= 5:
-                weapon = payload[4]
-                f('Silah kodu', f'0x{weapon:02x}', 'hex')
+                wcode = payload[4]
+                f('Silah kodu', f"0x{wcode:02x} — {_WEAPONS.get(wcode, 'Bilinmiyor')}", 'val')
+            if len(payload) >= 6:
+                f('Ek bayt@5', f'0x{payload[5]:02x}', 'hex')
 
-        elif opcode_byte == 0x4c and len(payload) >= 2:  # CHAT / login akışında istemci onay paketi
-            # Oyun içi: [1B len][str gönderen][1B len][str mesaj]
-            # Login fazı: 16 B binary — Pascal string parse başarısız olursa ham hex göster
-            first_len = payload[0]
-            if first_len < len(payload) and all(0x20 <= b < 0x7f or b == 0 for b in payload[1:first_len+1]):
-                sender, off = _try_string(payload, 0)
+        # ── 0x4c CHAT ─────────────────────────────────────────────────────────
+        elif opcode_byte == 0x4c and len(payload) >= 2:
+            # Oyun içi: [1B len][string gönderen][1B len][string mesaj]
+            # Login fazı: 16 B binary token — Pascal string parse başarısız olursa hex
+            sender, off = _try_string(payload, 0)
+            if sender is not None:
+                f('Gönderen', sender, 'str')
                 if off < len(payload):
                     msg, _ = _try_string(payload, off)
-                    f('Gönderen', sender, 'str')
-                    f('Mesaj',    msg,    'str')
-                else:
-                    f('Gönderen', sender, 'str')
+                    if msg is not None:
+                        f('Mesaj', msg, 'str')
+                    else:
+                        f('Mesaj (ham hex)', payload[off:].hex(), 'hex')
             else:
-                f('Token/Binary (hex)', payload.hex(), 'hex')
+                f('Token / Binary (ham hex)', payload.hex(), 'hex')
 
-        elif opcode_byte in (0x55, 0x57) and len(payload) >= 2:
-            # SESSION_REQ / DATA_ACK — login akışında C→S, 16 B payload [✓]
-            # Binary struct; büyük olasılıkla oturum token veya kimlik doğrulama verisi.
-            f('Token (hex)', payload[:16].hex() if len(payload) >= 16 else payload.hex(), 'hex')
-            if len(payload) >= 4:
-                maybe_id = struct.unpack_from('<I', payload, 0)[0]
-                f('Olası token ID@0 (u32)', f'0x{maybe_id:08x}', 'hex')
+        # ── 0x4d SERVER_REDIR ─────────────────────────────────────────────────
+        elif opcode_byte == 0x4d and len(payload) >= 6:
+            ip_bytes = payload[0:4]
+            ip_str   = '.'.join(str(b) for b in ip_bytes)
+            port     = struct.unpack_from('<H', payload, 4)[0]
+            f('Hedef IP', ip_str, 'str')
+            f('Port', port, 'u16')
 
-        elif opcode_byte == 0x50 and len(payload) >= 4:  # SCORE
+        # ── 0x4e GRENADE ─────────────────────────────────────────────────────
+        elif opcode_byte == 0x4e and len(payload) >= 1:
+            gtype = payload[0]
+            f('Bomba tipi', f'0x{gtype:02x}', 'hex')
+            if len(payload) >= 13:
+                x, y, z = struct.unpack_from('<fff', payload, 1)
+                f('Başlangıç X', f'{x:.2f}', 'float')
+                f('Başlangıç Y', f'{y:.2f}', 'float')
+                f('Başlangıç Z', f'{z:.2f}', 'float')
+
+        # ── 0x50 SCORE ────────────────────────────────────────────────────────
+        elif opcode_byte == 0x50 and len(payload) >= 4:
             team_a = struct.unpack_from('<H', payload, 0)[0]
             team_b = struct.unpack_from('<H', payload, 2)[0]
-            f('Takım A', team_a, 'u16')
-            f('Takım B', team_b, 'u16')
-
-        elif opcode_byte == 0x32 and len(payload) >= 2:  # GAME_START
-            map_id = struct.unpack_from('<H', payload, 0)[0]
-            f('Harita ID', map_id, 'u16')
-            if len(payload) >= 3:
-                mode = payload[2]
-                modes = {0:'Deathmatch', 1:'Team DM', 2:'Bomba', 3:'Bayrak'}
-                f('Mod', f"{modes.get(mode, f'0x{mode:02x}')}", 'val')
-
-        elif opcode_byte == 0x3c and len(payload) >= 12: # SPAWN
-            x, y, z = struct.unpack_from('<fff', payload, 0)
-            f('Spawn X', f'{x:.1f}', 'float')
-            f('Spawn Y', f'{y:.1f}', 'float')
-            f('Spawn Z', f'{z:.1f}', 'float')
-            if len(payload) >= 13:
-                team = payload[12]
-                f('Takım', 'Mavi' if team == 0 else ('Kırmızı' if team == 1 else f'0x{team:02x}'), 'val')
-
-        elif opcode_byte == 0x7b and len(payload) >= 2:  # FRIEND_LIST — 88 B veya 752 B payload [✓]
-            # Binary struct; gerçek alan düzeni bilinmiyor.
-            # 88 B ve 752 B versiyonlar farklı içerik taşıyor olabilir (short vs long list).
-            f('Payload boyutu', len(payload), 'u32')
-            if len(payload) >= 4:
-                maybe_count = struct.unpack_from('<H', payload, 0)[0]
-                f('Alan@0 (u16, olası giriş sayısı?)', f'0x{maybe_count:04x} ({maybe_count})', 'hex')
+            f('Takım A (Mavi)', team_a, 'u16')
+            f('Takım B (Kırmızı)', team_b, 'u16')
             if len(payload) >= 6:
-                second_u16 = struct.unpack_from('<H', payload, 2)[0]
-                f('Alan@2 (u16)', f'0x{second_u16:04x} ({second_u16})', 'hex')
+                f('Alan@4 (u16)', struct.unpack_from('<H', payload, 4)[0], 'u16')
+
+        # ── 0x51 KILL_FEED ────────────────────────────────────────────────────
+        elif opcode_byte == 0x51 and len(payload) >= 4:
+            killer = struct.unpack_from('<H', payload, 0)[0]
+            victim = struct.unpack_from('<H', payload, 2)[0]
+            f('Öldüren ID', f'{killer} (0x{killer:04x})', 'u16')
+            f('Ölen ID',    f'{victim} (0x{victim:04x})', 'u16')
+            if len(payload) >= 5:
+                wcode = payload[4]
+                f('Silah', f"0x{wcode:02x} — {_WEAPONS.get(wcode, 'Bilinmiyor')}", 'val')
+
+        # ── 0x55 SESSION_REQ / 0x57 DATA_ACK (16 B payload) ─────────────────
+        elif opcode_byte in (0x55, 0x57) and len(payload) >= 2:
+            # Binary token — gerçek trafik verisiyle C→S doğrulandı [✓]
+            tok = payload[:16].hex() if len(payload) >= 16 else payload.hex()
+            f('Token (hex)', tok, 'hex')
+            if len(payload) >= 4:
+                maybe_id = struct.unpack_from('<I', payload, 0)[0]
+                f('Alan@0 (u32, olası token ID)', f'0x{maybe_id:08x}', 'hex')
+            if len(payload) >= 8:
+                second   = struct.unpack_from('<I', payload, 4)[0]
+                f('Alan@4 (u32)', f'0x{second:08x}', 'hex')
+
+        # ── 0x56 XP_UPDATE ────────────────────────────────────────────────────
+        elif opcode_byte == 0x56 and len(payload) >= 4:
+            xp = struct.unpack_from('<I', payload, 0)[0]
+            f('Yeni XP (u32)', xp, 'u32')
+            if len(payload) >= 6:
+                level = struct.unpack_from('<H', payload, 4)[0]
+                f('Yeni seviye', level, 'u16')
+
+        # ── 0x64 HEARTBEAT ────────────────────────────────────────────────────
+        elif opcode_byte == 0x64 and len(payload) >= 4:
+            ts = struct.unpack_from('<I', payload)[0]
+            f('Timestamp (u32 LE)', ts, 'u32')
+
+        # ── 0x6e SERVER_INFO ─────────────────────────────────────────────────
+        elif opcode_byte == 0x6e and len(payload) >= 6:
+            ip_bytes = payload[0:4]
+            ip_str   = '.'.join(str(b) for b in ip_bytes)
+            port     = struct.unpack_from('<H', payload, 4)[0]
+            f('Sunucu IP', ip_str, 'str')
+            f('Port', port, 'u16')
+            if len(payload) >= 7:
+                region = payload[6]
+                f('Bölge kodu', f'0x{region:02x}', 'hex')
+
+        # ── 0x7b FRIEND_LIST (88 B veya 752 B payload) ───────────────────────
+        elif opcode_byte == 0x7b and len(payload) >= 2:
+            f('Payload boyutu', len(payload), 'u32')
+            if len(payload) >= 2:
+                maybe_count = struct.unpack_from('<H', payload, 0)[0]
+                f('Alan@0 (u16, olası arkadaş sayısı)', f'{maybe_count} (0x{maybe_count:04x})', 'hex')
+            if len(payload) >= 4:
+                second = struct.unpack_from('<H', payload, 2)[0]
+                f('Alan@2 (u16)', f'{second} (0x{second:04x})', 'hex')
+            if len(payload) >= 6:
+                third = struct.unpack_from('<H', payload, 4)[0]
+                f('Alan@4 (u16)', f'{third} (0x{third:04x})', 'hex')
 
     except Exception:
         pass  # parse hatası → sadece hex dump göster
 
     return fields
 
-def decode_packet(opcode_byte: int, payload: bytes, direction: str) -> dict:
-    """Paketi ayrıştır: isim + açıklama + alanlar + hex dump döndür."""
+def decode_packet(opcode_byte: int, payload: bytes, direction: str,
+                  parse_fields: bool = True) -> dict:
+    """Paketi ayrıştır: isim + açıklama + alanlar + hex dump döndür.
+
+    parse_fields=False → sadece isim/açıklama + hex dump; _decode_fields çalışmaz.
+    Şifre çözme yanlış olan (mismatch / proto?) paketlerde çöp field göstermemek için
+    fmt_packet bu parametreyi status'e göre geçirir.
+    """
     entry = _OPCODES.get(opcode_byte)
     name  = entry[0] if entry else f'UNK_{opcode_byte:02X}'
     hint  = entry[1] if entry else '?'
     desc  = entry[2] if entry else 'Bilinmeyen opcode — ham veri gösteriliyor'
 
-    fields = _decode_fields(opcode_byte, payload, direction)
+    fields = _decode_fields(opcode_byte, payload, direction) if parse_fields else []
 
     # Hex dump (her zaman eklenir)
     dump_rows = []
@@ -678,9 +962,12 @@ def fmt_packet(seq, direction, raw, plain, ts=None):
     else:                           base['status'] = 'mismatch'
 
     # Decode packet fields
+    # parse_fields sadece şifre çözme güvenilirken açık — mismatch/proto? durumunda
+    # ikili çöp üzerinde field parser çalıştırmak yanıltıcı sonuçlar üretir.
+    _good_status = base['status'] in ('ok', 'large')
     if op_byte is not None:
         payload = plain[3:]
-        dec = decode_packet(op_byte, payload, direction)
+        dec = decode_packet(op_byte, payload, direction, parse_fields=_good_status)
         base['decoded'] = dec
         base['pkt_name'] = dec['name']
         base['opcode'] = f"0x{op_byte:02x}"
@@ -864,7 +1151,9 @@ async def _redecrypt_session():
             elif len_ok:                  ev['status'] = 'proto?'
             else:                         ev['status'] = 'mismatch'
             if op_byte is not None:
-                dec = decode_packet(op_byte, plain[3:], ev.get('dir', 'R'))
+                _good = ev['status'] in ('ok', 'large')
+                dec = decode_packet(op_byte, plain[3:], ev.get('dir', 'R'),
+                                    parse_fields=_good)
                 ev['decoded']   = dec
                 ev['pkt_name']  = dec['name']
                 ev['opcode']    = f"0x{op_byte:02x}"
