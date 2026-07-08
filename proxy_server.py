@@ -157,12 +157,9 @@ def crack_key(candidates, iv_bytes, test_packets, min_hits=2):
     best_p, best_s, best_hits = None, None, -1
     for P, S in candidates:
         hits = 0
-        iv_state = bytearray(iv_bytes)
-        n_state = 0
         for cipher, size in test_packets:
-            plain, iv_state, n_state = _cfb64(P, S, cipher, bytes(iv_state),
-                                               encrypt=False, n_in=n_state)
-            iv_state = bytearray(iv_state)
+            # Per-buffer: her paket n=0'dan bağımsız çözülür
+            plain, _, _ = _cfb64(P, S, cipher, iv_bytes, encrypt=False, n_in=0)
             expected_len = (size - 3) & 0xFF
             if len(plain) >= 2 and plain[0] == expected_len and plain[1] == 0x0D:
                 hits += 1
@@ -328,29 +325,18 @@ class Session:
         return False
 
     def decrypt(self, cipher, direction='R'):
-        """Stateful CFB-64 decrypt — yön başına bağımsız akış durumu korunur."""
+        """Per-buffer CFB-64 decrypt — her TCP tamponu n=0'dan bağımsız çözülür.
+        PointBlank her send()/recv() çağrısını aynı başlangıç IV'i ile ayrı ayrı şifreler."""
         if not self.has_key() or not self.has_iv():
             return None
-        if direction == 'R':
-            if self.iv_recv is None:
-                self.iv_recv, self.n_recv = self.iv, 0
-            plain, self.iv_recv, self.n_recv = _cfb64(
-                self.P, self.S, cipher, self.iv_recv, encrypt=False, n_in=self.n_recv)
-        else:
-            if self.iv_send is None:
-                self.iv_send, self.n_send = self.iv, 0
-            plain, self.iv_send, self.n_send = _cfb64(
-                self.P, self.S, cipher, self.iv_send, encrypt=False, n_in=self.n_send)
+        plain, _, _ = _cfb64(self.P, self.S, cipher, self.iv, encrypt=False, n_in=0)
         return plain
 
     def encrypt(self, plain):
-        """Stateful CFB-64 encrypt — SEND akışı durumu korunur."""
+        """Per-buffer CFB-64 encrypt — her inject n=0'dan bağımsız şifrelenir."""
         if not self.has_key() or not self.has_iv():
             return None
-        if self.iv_send is None:
-            self.iv_send, self.n_send = self.iv, 0
-        cipher, self.iv_send, self.n_send = _cfb64(
-            self.P, self.S, plain, self.iv_send, encrypt=True, n_in=self.n_send)
+        cipher, _, _ = _cfb64(self.P, self.S, plain, self.iv, encrypt=True, n_in=0)
         return cipher
 
 session = Session()
@@ -362,70 +348,130 @@ session = Session()
 # Yeni opcode eklemek için buraya satır ekle; proxy yeniden başlatmaya gerek yok
 # (sunucu yeniden başlatılınca tablo güncellenir).
 _OPCODES: dict[int, tuple[str, str, str]] = {
+    # ══════════════════════════════════════════════════════════════
+    # Opcode tablosu: (kısa_ad, yön, açıklama)
+    # Yön: 'C→S' istemci→sunucu · 'S→C' sunucu→istemci · 'both' her iki yön
+    # Güven seviyesi notları:
+    #   [✓] Gerçek trafik verisiyle doğrulanmış (decrypt=ok, payload incelendi)
+    #   [~] Protokol akışından çıkarılan tahmin
+    #   [?] Bilinmiyor / spekülatif
+    # ══════════════════════════════════════════════════════════════
     # ── Bağlantı / Oturum ──────────────────────────────────────
-    0x01: ('CONNECT',       '?',   'Bağlantı isteği / ilk握手'),
-    0x02: ('PING',          '?',   'Bağlantı canlı tutma — ping'),
-    0x03: ('PONG',          '?',   'Bağlantı canlı tutma — pong'),
-    0x04: ('DISCONNECT',    '?',   'Bağlantı kesme bildirimi'),
+    0x01: ('CONNECT',       'C→S',  'Bağlantı isteği — TCP bağlantı kurulduktan sonra ilk paket [~]'),
+    0x02: ('PING',          'both', 'Canlı tutma ping — her iki yönde çalışır [~]'),
+    0x03: ('PONG',          'both', 'Canlı tutma pong yanıtı [~]'),
+    0x04: ('DISCONNECT',    'both', 'Bağlantı kesme bildirimi — istemci veya sunucu [~]'),
+    0x05: ('HANDSHAKE',     'both', 'El sıkışma / kriptografi başlatma [~]'),
+    0x06: ('SESSION_OK',    'S→C',  'Oturum onayı — sunucu bağlantıyı kabul etti [~]'),
+    0x07: ('RECONNECT',     'C→S',  'Yeniden bağlantı isteği — oturum ID ile [~]'),
+    0x08: ('ECHO',          'both', 'Bağlantı test echo — RTT ölçümü [~]'),
     # ── Giriş / Kimlik ──────────────────────────────────────────
-    0x14: ('LOGIN_REQ',     'C→S', 'Kullanıcı adı + şifre/hash gönderimi'),
-    0x15: ('LOGIN_ACK',     'S→C', 'Login yanıtı (başarı/hata kodu)'),
-    0x16: ('AUTH_TOKEN',    'C→S', 'Kimlik doğrulama token\'ı'),
-    0x17: ('USER_INFO',     'S→C', 'Kullanıcı bilgileri (seviye, deneyim)'),
-    0x18: ('CHAR_SELECT',   'C→S', 'Karakter / slot seçimi'),
+    0x14: ('LOGIN_REQ',     'C→S',  'Kullanıcı adı + şifre/hash gönderimi [~]'),
+    0x15: ('LOGIN_ACK',     'S→C',  'Login yanıtı — başarı kodu + kullanıcı ID [~]'),
+    0x16: ('AUTH_TOKEN',    'C→S',  'Kimlik doğrulama token\'ı — oturum anahtarı [~]'),
+    0x17: ('USER_INFO',     'S→C',  'Kullanıcı bilgileri — seviye, deneyim, rütbe [~]'),
+    0x18: ('CHAR_SELECT',   'C→S',  'Karakter / slot seçimi [~]'),
     # ── Lobi / Kanal ────────────────────────────────────────────
-    0x1e: ('LOBBY_LIST',    'S→C', 'Lobi / kanal listesi'),
-    0x1f: ('CHANNEL_JOIN',  'C→S', 'Kanala giriş isteği'),
-    0x20: ('CHANNEL_ACK',   'S→C', 'Kanal giriş yanıtı'),
-    0x21: ('PLAYER_LIST',   'S→C', 'Kanaldaki oyuncu listesi'),
-    0x22: ('PLAYER_ENTER',  'S→C', 'Kanala yeni oyuncu girdi'),
-    0x23: ('PLAYER_LEAVE',  'S→C', 'Kanaldan oyuncu çıktı'),
+    0x1e: ('LOBBY_LIST',    'S→C',  'Lobi / kanal listesi — kanal adları ve oyuncu sayıları [~]'),
+    0x1f: ('CHANNEL_JOIN',  'C→S',  'Kanala giriş isteği [~]'),
+    0x20: ('CHANNEL_ACK',   'S→C',  'Kanal giriş yanıtı — kabul/red kodu [~]'),
+    0x21: ('PLAYER_LIST',   'S→C',  'Kanaldaki oyuncu listesi — toplu oyuncu snapshot [~]'),
+    0x22: ('PLAYER_ENTER',  'S→C',  'Kanala yeni oyuncu girdi — oyuncu bilgisi [~]'),
+    0x23: ('PLAYER_LEAVE',  'S→C',  'Kanaldan oyuncu çıktı — oyuncu ID [~]'),
     # ── Oda ─────────────────────────────────────────────────────
-    0x28: ('ROOM_LIST',     'S→C', 'Oda listesi'),
-    0x29: ('ROOM_CREATE',   'C→S', 'Oda oluşturma isteği'),
-    0x2a: ('ROOM_JOIN',     'C→S', 'Odaya katılma isteği'),
-    0x2b: ('ROOM_LEAVE',    'C→S', 'Odadan ayrılma'),
-    0x2c: ('ROOM_ACK',      'S→C', 'Oda işlemi yanıtı'),
-    0x2d: ('ROOM_INFO',     'S→C', 'Oda bilgisi (harita, mod, oyuncular)'),
-    0x2e: ('ROOM_READY',    'C→S', 'Hazır butonu'),
-    0x2f: ('ROOM_KICK',     'S→C', 'Odadan atıldı'),
-    # ── Oyun ────────────────────────────────────────────────────
-    0x32: ('GAME_START',    'S→C', 'Oyun başladı — harita ve takım bilgisi'),
-    0x33: ('GAME_END',      'S→C', 'Oyun bitti — skor tablosu'),
-    0x34: ('ROUND_START',   'S→C', 'Tur başladı'),
-    0x35: ('ROUND_END',     'S→C', 'Tur bitti'),
-    0x36: ('MAP_DATA',      'S→C', 'Harita verisi / spawn noktaları'),
-    # ── Oyuncu Durumu ───────────────────────────────────────────
-    0x3c: ('SPAWN',         'S→C', 'Spawn koordinatları + takım'),
-    0x3d: ('MOVE',          'both','Hareket paketi (konum + açı)'),
-    0x3e: ('JUMP',          'C→S', 'Zıplama'),
-    0x3f: ('CROUCH',        'C→S', 'Çömelme'),
-    0x40: ('STANCE',        'both','Duruş değişikliği'),
+    0x28: ('ROOM_LIST',     'S→C',  'Oda listesi — lobi odaları snapshot [~]'),
+    0x29: ('ROOM_CREATE',   'C→S',  'Oda oluşturma isteği — harita, mod, ayarlar [~]'),
+    0x2a: ('ROOM_JOIN',     'C→S',  'Odaya katılma isteği — oda ID + şifre [~]'),
+    0x2b: ('ROOM_LEAVE',    'C→S',  'Odadan ayrılma [~]'),
+    0x2c: ('ROOM_ACK',      'S→C',  'Oda işlemi yanıtı — oluşturma/katılma sonucu [~]'),
+    0x2d: ('ROOM_INFO',     'S→C',  'Oda bilgisi — harita, mod, oyuncular, ayarlar [~]'),
+    0x2e: ('ROOM_READY',    'C→S',  'Hazır butonu — oyuncu hazır/hazır değil toggle [~]'),
+    0x2f: ('ROOM_KICK',     'S→C',  'Odadan atıldı — neden kodu [~]'),
+    # ── Oyun / Tur ──────────────────────────────────────────────
+    0x32: ('GAME_START',    'S→C',  'Oyun başladı — harita ID, takım atamaları [~]'),
+    0x33: ('GAME_END',      'S→C',  'Oyun bitti — kazanan takım, skor tablosu [~]'),
+    0x34: ('ROUND_START',   'S→C',  'Tur başladı — süre ve takım bilgisi [~]'),
+    0x35: ('ROUND_END',     'S→C',  'Tur bitti — tur kazananı [~]'),
+    0x36: ('MAP_DATA',      'S→C',  'Harita verisi / spawn noktaları [~]'),
+    0x39: ('ROOM_SETTINGS', 'C→S',  'Oda ayarı değiştirme isteği — oda lideri gönderir [~]'),
+    # ── Oyuncu Konumu ve Durumu ──────────────────────────────────
+    0x3c: ('SPAWN',         'S→C',  'Spawn koordinatları — konum (x,y,z) + takım [~]'),
+    0x3d: ('MOVE',          'both', 'Hareket paketi — konum (x,y,z) + yaw açısı [~]'),
+    0x3e: ('JUMP',          'C→S',  'Zıplama [~]'),
+    0x3f: ('CROUCH',        'C→S',  'Çömelme / ayağa kalkma toggle [~]'),
+    0x40: ('STANCE',        'both', 'Duruş değişikliği / hareket durumu; login akışında 291 B olarak da görüldü (proto=0x0C) [~]'),
+    # ── Oyuncu genişletilmiş durum ──────────────────────────────
+    0x41: ('STANCE_EX',     'both', 'Duruş / hareket genişletilmiş — animasyon durumu [~]'),
+    0x42: ('DAMAGE_NOTIF',  'S→C',  'Hasar bildirimi — aldığı hasar miktarı [~]'),
+    0x43: ('BATCH_DATA',    'S→C',  'Toplu kanal/oda verisi — birden fazla alanı bir arada gönderir [~]'),
+    0x44: ('PLAYER_DATA',   'S→C',  'Oyuncu temel verisi — isim, seviye, takım [~]'),
+    0x45: ('CHAR_DATA',     'S→C',  'Karakter profil verisi — login sonrası S→C, 163 B (160 B payload) [✓]'),
     # ── Silah / Savaş ───────────────────────────────────────────
-    0x46: ('SHOOT',         'C→S', 'Ateş paketi — silah ve hedef'),
-    0x47: ('HIT',           'S→C', 'Vurma bildirimi — hasar + vuran'),
-    0x48: ('MISS',          'S→C', 'Ateş ıskalaması'),
-    0x49: ('RELOAD',        'C→S', 'Şarjör doldurma'),
-    0x4a: ('WEAPON_SWITCH', 'C→S', 'Silah değiştirme'),
-    0x4b: ('PLAYER_DEAD',   'S→C', 'Ölüm bildirimi — ölen ve öldüren'),
-    0x4e: ('GRENADE',       'C→S', 'El bombası fırlatma'),
-    0x4f: ('EXPLOSION',     'S→C', 'Patlama efekti'),
-    # ── Sohbet ──────────────────────────────────────────────────
-    0x4c: ('CHAT',          'both','Sohbet mesajı'),
-    0x5b: ('SYSTEM_MSG',    'S→C', 'Sistem mesajı / duyuru'),
+    0x46: ('SHOOT',         'C→S',  'Ateş paketi — silah ID ve hedef koordinatı [~]'),
+    0x47: ('HIT',           'S→C',  'Vurma bildirimi — saldıran ID, hedef ID, hasar, vurulan bölge; 35 B [✓]'),
+    0x48: ('ITEM_ACTION',   'C→S',  'Eşya kullanma / bırakma — eşya ID ve aksiyon kodu [~]'),
+    0x49: ('RELOAD',        'C→S',  'Şarjör doldurma [~]'),
+    0x4a: ('WEAPON_SWITCH', 'C→S',  'Silah değiştirme — silah slot ID [~]'),
+    0x4b: ('PLAYER_DEAD',   'S→C',  'Ölüm bildirimi — ölen ID, öldüren ID, silah kodu [~]'),
+    0x4c: ('CHAT',          'both', 'Sohbet mesajı; C→S olarak login akışında da gözlemlendi, 19 B [✓]'),
+    0x4d: ('SERVER_REDIR',  'S→C',  'Sunucu yönlendirme — oyun sunucusu IP + port [~]'),
+    0x4e: ('GRENADE',       'C→S',  'El bombası fırlatma — tip + başlangıç koordinatı [~]'),
+    0x4f: ('EXPLOSION',     'S→C',  'Patlama efekti — merkez koordinatı + yarıçap [~]'),
     # ── Skor / İstatistik ───────────────────────────────────────
-    0x50: ('SCORE',         'S→C', 'Skor güncellemesi'),
-    0x51: ('KILL_FEED',     'S→C', 'Kill/ölüm özeti'),
-    0x52: ('STATS',         'S→C', 'Oyun sonu istatistikleri'),
+    0x50: ('SCORE',         'S→C',  'Skor güncellemesi — takım A ve B puanı [~]'),
+    0x51: ('KILL_FEED',     'S→C',  'Kill/ölüm özeti — öldüren, ölen, silah [~]'),
+    0x52: ('STATS',         'S→C',  'Oyun sonu istatistikleri — tüm oyuncu skorları [~]'),
+    # ── Oyuncu / Takım Genişletilmiş ─────────────────────────────
+    0x53: ('MAP_INFO_EX',   'S→C',  'Harita genişletilmiş bilgi — ek harita parametreleri [~]'),
+    0x54: ('TEAM_INFO',     'S→C',  'Takım ataması / bilgisi — takım isimleri ve üyeler [~]'),
+    # ── DİKKAT: 0x55 ve 0x57 gerçek trafik verisiyle C→S doğrulandı ──
+    0x55: ('SESSION_REQ',   'C→S',  'Oturum isteği / istemci onay paketi — login akışında C→S, 19 B (16 B payload) [✓]'),
+    0x56: ('XP_UPDATE',     'S→C',  'Deneyim / seviye güncellemesi — yeni XP ve seviye [~]'),
+    0x57: ('DATA_ACK',      'C→S',  'Sunucu verisi onayı — login akışında C→S, 19 B (16 B payload) [✓]'),
+    0x58: ('SERVER_CFG',    'S→C',  'Sunucu yapılandırma / parametreler [~]'),
+    0x59: ('CHAT_CHANNEL',  'S→C',  'Sohbet kanalı bilgisi [~]'),
     # ── Envanter / Mağaza ───────────────────────────────────────
-    0x5a: ('SHOP_BUY',      'C→S', 'Eşya / silah satın alma'),
-    0x5c: ('INVENTORY',     'S→C', 'Envanter listesi'),
-    0x5d: ('EQUIP',         'C→S', 'Eşya donatma'),
-    # ── Diğer ───────────────────────────────────────────────────
-    0x64: ('HEARTBEAT',     'both','Uygulama seviyesi canlı tutma'),
-    0x6e: ('SERVER_INFO',   'S→C', 'Sunucu bilgisi (IP, port, bölge)'),
-    0x78: ('CLAN_INFO',     'S→C', 'Klan bilgisi'),
+    0x5a: ('SHOP_BUY',      'C→S',  'Eşya / silah satın alma — ürün ID + miktar [~]'),
+    0x5b: ('SYSTEM_MSG',    'S→C',  'Sistem mesajı / duyuru — metin içerik [~]'),
+    0x5c: ('INVENTORY',     'S→C',  'Envanter listesi — sahip olunan eşyalar [~]'),
+    0x5d: ('EQUIP',         'C→S',  'Eşya donatma — slot + eşya ID [~]'),
+    0x5e: ('ROOM_STATE',    'S→C',  'Oda üye durumu güncellemesi — hazır/hazır değil [~]'),
+    0x5f: ('RANK_INFO',     'S→C',  'Rütbe / VIP bilgisi — mevcut rütbe ve puanı [~]'),
+    # ── Oyun İçi Geniş Veri ─────────────────────────────────────
+    0x62: ('PLAYER_STATS',  'S→C',  'Oyuncu istatistik paketi — K/D, isabet vs. [~]'),
+    0x63: ('KILL_STREAK',   'S→C',  'Kill serisi / combo bildirimi [~]'),
+    0x64: ('HEARTBEAT',     'both', 'Uygulama seviyesi canlı tutma — zaman damgası [~]'),
+    0x65: ('ACHIEVEMENT',   'S→C',  'Başarım / rozet verisi — yeni kazanılan [~]'),
+    0x68: ('WORLD_DATA',    'S→C',  'Oyun dünyası / harita event verisi [~]'),
+    0x69: ('OBJECTIVE',     'S→C',  'Hedef / görev bilgisi — bomba, bayrak konumu [~]'),
+    0x6a: ('LOBBY_INFO',    'S→C',  'Lobi / kanal toplu veri [~]'),
+    0x6b: ('ROOM_ENTER_ACK','S→C',  'Odaya giriş onayı — slot numarası [~]'),
+    0x6c: ('GAME_EVENT',    'S→C',  'Oyun içi olay — kapı, araç, nesne [~]'),
+    0x6d: ('POS_BATCH',     'S→C',  'Oyuncu konum toplu paketi — tüm oyuncuların konumu [~]'),
+    0x6e: ('SERVER_INFO',   'S→C',  'Sunucu bilgisi — IP, port, bölge kodu [~]'),
+    0x6f: ('SESSION_DATA',  'S→C',  'Oturum verisi — session token ve parametreler [~]'),
+    # ── Toplu Durum (büyük buffer'lardan sub-paket olarak gelir) ─
+    0x70: ('STATE_BATCH',   'S→C',  'Oyuncu durum toplu paketi — anlık snapshot [~]'),
+    0x71: ('MAP_OBJECTS',   'S→C',  'Harita nesneleri / pickup noktaları [~]'),
+    0x72: ('EQUIP_INFO',    'S→C',  'Donanım / ekipman bilgisi — silah ve zırh listesi [~]'),
+    0x73: ('GAME_RULES',    'S→C',  'Oyun kuralları / mod ayarları [~]'),
+    0x74: ('MISSION',       'S→C',  'Görev bilgisi / ilerleme yüzdesi [~]'),
+    0x75: ('VOTE',          'both', 'Oylama — kick, harita değişimi, oyun sonu [~]'),
+    0x77: ('PLAYER_ACTION', 'both', 'Oyuncu eylem paketi — animasyon/aksiyon kodu [~]'),
+    0x78: ('CLAN_INFO',     'S→C',  'Klan bilgisi — klan adı, üye sayısı, rütbe [~]'),
+    0x79: ('CLAN_RANK',     'S→C',  'Klan rütbe güncellemesi [~]'),
+    0x7a: ('BROADCAST',     'S→C',  'Sunucu yayını / duyurusu — sistem mesajı [~]'),
+    0x7b: ('FRIEND_LIST',   'S→C',  'Arkadaş listesi — login sonrası S→C; 91 B (88 B) veya 755 B (752 B, proto=0x0F) [✓]'),
+    0x7c: ('FRIEND_STATUS', 'S→C',  'Arkadaş çevrimiçi durum güncellemesi [~]'),
+    0x7d: ('SOCIAL_DATA',   'S→C',  'Sosyal / topluluk verisi — guild, arkadaş grubu [~]'),
+    0x7e: ('EVENT_BATCH',   'S→C',  'Oyun olay toplu paketi — sunucu akışı [~]'),
 }
+
+# Geçerli proto byte değerleri (PointBlank varyantı):
+#   0x0D → standart paket (≤258 B), her iki yön
+#   0x0C → büyük istemci paketi (>258 B) — gerçek trafik verisiyle doğrulandı
+#   0x0F → büyük sunucu paketi (>258 B) — gerçek trafik verisiyle doğrulandı
+_VALID_PROTO: frozenset[int] = frozenset({0x0C, 0x0D, 0x0F})
 
 def _ascii_safe(b: bytes) -> str:
     return ''.join(chr(x) if 0x20 <= x < 0x7f else '.' for x in b)
@@ -474,18 +520,25 @@ def _decode_fields(opcode_byte: int, payload: bytes, direction: str) -> list[dic
                 yaw   = struct.unpack_from('<H', payload, 12)[0]
                 f('Yaw (açı)', f'{yaw} ({yaw/65535*360:.1f}°)', 'u16')
 
-        elif opcode_byte == 0x47 and len(payload) >= 6:  # HIT
+        elif opcode_byte == 0x45 and len(payload) >= 4:  # CHAR_DATA — 160 B login payload
+            # Binary struct; gerçek alan düzeni bilinmiyor.
+            # İlk u32: büyük olasılıkla oyuncu/oturum ID'si.
+            maybe_id = struct.unpack_from('<I', payload, 0)[0]
+            f('Olası oyuncu ID (u32@0)', f'0x{maybe_id:08x}', 'hex')
+            f('Payload boyutu', len(payload), 'u32')
+
+        elif opcode_byte == 0x47 and len(payload) >= 6:  # HIT — 32 B; login fazında alan anlamı belirsiz
+            # Uyarı: bu decoder oyun içi HIT semantiği varsayar.
+            # Login fazında (35 B buffer) alanlar farklı anlam taşıyabilir.
             attacker = struct.unpack_from('<H', payload, 0)[0]
             victim   = struct.unpack_from('<H', payload, 2)[0]
             damage   = struct.unpack_from('<H', payload, 4)[0]
-            f('Saldıran ID', attacker, 'u16')
-            f('Hedef ID',    victim,   'u16')
-            f('Hasar',       damage,   'u16')
+            f('Alan@0 (u16)', f'0x{attacker:04x}', 'hex')
+            f('Alan@2 (u16)', f'0x{victim:04x}',   'hex')
+            f('Alan@4 (u16)', f'0x{damage:04x}',   'hex')
             if len(payload) >= 7:
-                zone_map = {0:'Gövde', 1:'Kafa', 2:'Sol kol', 3:'Sağ kol',
-                            4:'Sol bacak', 5:'Sağ bacak'}
                 zone = payload[6]
-                f('Bölge', f"{zone_map.get(zone, f'0x{zone:02x}')}", 'val')
+                f('Alan@6 (u8)', f'0x{zone:02x}', 'hex')
 
         elif opcode_byte == 0x4b and len(payload) >= 4:  # PLAYER_DEAD
             killer = struct.unpack_from('<H', payload, 0)[0]
@@ -496,12 +549,28 @@ def _decode_fields(opcode_byte: int, payload: bytes, direction: str) -> list[dic
                 weapon = payload[4]
                 f('Silah kodu', f'0x{weapon:02x}', 'hex')
 
-        elif opcode_byte == 0x4c and len(payload) >= 2:  # CHAT
-            sender, off = _try_string(payload, 0)
-            if off < len(payload):
-                msg, _ = _try_string(payload, off)
-                f('Gönderen', sender, 'str')
-                f('Mesaj',    msg,    'str')
+        elif opcode_byte == 0x4c and len(payload) >= 2:  # CHAT / login akışında istemci onay paketi
+            # Oyun içi: [1B len][str gönderen][1B len][str mesaj]
+            # Login fazı: 16 B binary — Pascal string parse başarısız olursa ham hex göster
+            first_len = payload[0]
+            if first_len < len(payload) and all(0x20 <= b < 0x7f or b == 0 for b in payload[1:first_len+1]):
+                sender, off = _try_string(payload, 0)
+                if off < len(payload):
+                    msg, _ = _try_string(payload, off)
+                    f('Gönderen', sender, 'str')
+                    f('Mesaj',    msg,    'str')
+                else:
+                    f('Gönderen', sender, 'str')
+            else:
+                f('Token/Binary (hex)', payload.hex(), 'hex')
+
+        elif opcode_byte in (0x55, 0x57) and len(payload) >= 2:
+            # SESSION_REQ / DATA_ACK — login akışında C→S, 16 B payload [✓]
+            # Binary struct; büyük olasılıkla oturum token veya kimlik doğrulama verisi.
+            f('Token (hex)', payload[:16].hex() if len(payload) >= 16 else payload.hex(), 'hex')
+            if len(payload) >= 4:
+                maybe_id = struct.unpack_from('<I', payload, 0)[0]
+                f('Olası token ID@0 (u32)', f'0x{maybe_id:08x}', 'hex')
 
         elif opcode_byte == 0x50 and len(payload) >= 4:  # SCORE
             team_a = struct.unpack_from('<H', payload, 0)[0]
@@ -525,6 +594,17 @@ def _decode_fields(opcode_byte: int, payload: bytes, direction: str) -> list[dic
             if len(payload) >= 13:
                 team = payload[12]
                 f('Takım', 'Mavi' if team == 0 else ('Kırmızı' if team == 1 else f'0x{team:02x}'), 'val')
+
+        elif opcode_byte == 0x7b and len(payload) >= 2:  # FRIEND_LIST — 88 B veya 752 B payload [✓]
+            # Binary struct; gerçek alan düzeni bilinmiyor.
+            # 88 B ve 752 B versiyonlar farklı içerik taşıyor olabilir (short vs long list).
+            f('Payload boyutu', len(payload), 'u32')
+            if len(payload) >= 4:
+                maybe_count = struct.unpack_from('<H', payload, 0)[0]
+                f('Alan@0 (u16, olası giriş sayısı?)', f'0x{maybe_count:04x} ({maybe_count})', 'hex')
+            if len(payload) >= 6:
+                second_u16 = struct.unpack_from('<H', payload, 2)[0]
+                f('Alan@2 (u16)', f'0x{second_u16:04x} ({second_u16})', 'hex')
 
     except Exception:
         pass  # parse hatası → sadece hex dump göster
@@ -583,12 +663,17 @@ def fmt_packet(seq, direction, raw, plain, ts=None):
     op_byte = plain[2] if len(plain) > 2 else None
     base['opcode'] = op_byte
 
-    expected = (size - 3) & 0xFF
-    len_ok   = (base['len_field'] == expected and size <= 258)
-    proto_ok = (base['proto'] == 0x0D)
+    expected   = (size - 3) & 0xFF
+    len_ok     = (base['len_field'] == expected)
+    proto_ok   = (base['proto'] in _VALID_PROTO)
+    # 0x0D → standart (≤258 B), 0x0C/0x0F → büyük paket (>258 B) — hepsi geçerli
+    std_size   = (size <= 258)
+    alt_proto  = (base['proto'] in (0x0C, 0x0F))
 
-    if len_ok and proto_ok:         base['status'] = 'ok'
+    if len_ok and proto_ok and (std_size or alt_proto):
+        base['status'] = 'ok'
     elif proto_ok and not len_ok:   base['status'] = 'large'
+    elif proto_ok and len_ok:       base['status'] = 'ok'    # len_ok ama size>258 ve 0x0D
     elif len_ok and not proto_ok:   base['status'] = 'proto?'
     else:                           base['status'] = 'mismatch'
 
@@ -607,6 +692,46 @@ def fmt_packet(seq, direction, raw, plain, ts=None):
     if base['proto'] is not None:
         base['proto'] = f"0x{base['proto']:02x}"
     return base
+
+
+def _walk_subpackets(plain: bytes, raw: bytes) -> list[dict]:
+    """Decrypt edilmiş TCP tamponundan [len][0x0D][op][payload] bloklarını çıkar.
+    raw: orijinal şifreli buffer (slice için).
+
+    Geçerlilik kuralı (veri kaybı olmadan):
+      • buffer tamamen tüketildi (leftover == 0), VEYA
+      • kalan bayt sayısı < 3 (geçerli bir paket için minimum — padding sayılır).
+    Herhangi bir anlamlı artık varsa (leftover >= 3) split yapılmaz;
+    orijinal büyük event fmt_packet'e geri döner."""
+    pkts = []
+    i    = 0
+    while i + 3 <= len(plain):
+        length = plain[i]
+        proto  = plain[i + 1]
+        opcode = plain[i + 2]
+        total  = length + 3
+        if proto != 0x0D:
+            break                           # proto yanlış → framing bozuk
+        if i + total > len(plain):
+            break                           # buffer taşıyor → tamamlanmamış
+        pkts.append({
+            'offset':    i,
+            'total':     total,
+            'op':        opcode,
+            'len':       length,
+            'sub_plain': plain[i: i + total],
+            'sub_raw':   raw  [i: i + total] if i + total <= len(raw) else b'',
+        })
+        i += total
+
+    if not pkts:
+        return []
+
+    leftover = len(plain) - i
+    # Split yalnızca buffer tamamen tüketildiyse VEYA kalan < 3B (geçerli paket olamaz)
+    if leftover == 0 or (len(pkts) >= 2 and leftover < 3):
+        return pkts
+    return []   # anlamlı artık var → split yapılmaz, orijinal event korunur
 
 # ─── WebSocket: DLL bağlantısı (/dll) ────────────────────────────────────────
 
@@ -669,14 +794,19 @@ async def dll_handler(request):
 BF_KEY_SIZE = (18 + 4 * 256) * 4
 
 async def _handle_key_frame(raw: bytes):
-    """DLL'den gelen KEY frame (0x4B): BF_KEY otomatik yükle."""
+    """DLL'den gelen KEY frame (0x4B): BF_KEY yükle.
+    Doğrulanmamış DLL bellek taraması anahtarı bf_key.bin'e yazılmaz —
+    önbellekteki onaylı anahtar korunur; yalnızca OpenSSL hook / crack
+    ile doğrulanan anahtarlar bf_key.bin'i günceller."""
     if len(raw) < BF_KEY_SIZE:
         return
     P = list(struct.unpack_from('<18I', raw, 0))
     S = [list(struct.unpack_from('<256I', raw, (18 + i * 256) * 4)) for i in range(4)]
-    session.set_key(P, S)
     sig = (S[0][0], S[1][0], S[2][0], S[3][0])
-    confirmed = '✓ ONAYLANDI' if sig == CONFIRMED_SIG else '(doğrulanmadı)'
+    is_confirmed = sig == CONFIRMED_SIG
+    # Doğrulanmamış DLL key frame: bf_key.bin'i KORUMA — yanlış key önbelleği kirletmesin
+    session.set_key(P, S, save_cache=is_confirmed)
+    confirmed = '✓ ONAYLANDI' if is_confirmed else '(doğrulanmadı — önbelleksiz)'
     sig_str   = ' '.join(f'{x:08x}' for x in sig)
     msg = f'Anahtar DLL\'den otomatik yüklendi {confirmed} — SIG={sig_str}'
     print(f'[KEY] {msg}')
@@ -685,65 +815,76 @@ async def _handle_key_frame(raw: bytes):
     await _redecrypt_session()  # önceden encrypted gelen paketleri yeniden çöz
 
 async def _redecrypt_session():
-    """Tüm paketi baştan stateful oynat: RECV ve SEND CFB akışlarını sıfırlayıp
-    sırayla decrypt uygular. 'encrypted' / 'mismatch' paketleri günceller.
-    Doğru akış durumu için challenge olmayan TÜM paketler işlenir."""
+    """Tüm paketleri per-buffer modda yeniden çöz.
+    - Büyük buffer'lar (>258B): sub-paketlere ayrılır, her biri bağımsız event olarak kaydedilir.
+    - Küçük paketler: şifre açılır, status/opcode güncellenir.
+    - Seq numaraları expansion sonrası yeniden atanır."""
     if not session.has_key() or not session.has_iv():
         return
-    # Her yön için bağımsız başlangıç durumu
-    iv_r, n_r = session.iv, 0
-    iv_s, n_s = session.iv, 0
+    new_packets = []
     changed = 0
     for ev in session.packets:
         status = ev.get('status')
-        if status == 'challenge':
-            # Yeni challenge → IV güncelle, akışları sıfırla
-            raw_ch = bytes.fromhex(ev.get('raw_hex', ''))
-            if len(raw_ch) >= 11 and raw_ch[0] == 0xc5:
-                new_iv = bytes(raw_ch[3:11])
-                iv_r, n_r = new_iv, 0
-                iv_s, n_s = new_iv, 0
+        raw    = bytes.fromhex(ev.get('raw_hex', ''))
+
+        if status == 'challenge' or not raw:
+            new_packets.append(ev)
             continue
-        raw = bytes.fromhex(ev.get('raw_hex', ''))
-        if not raw:
-            continue
-        direction = ev.get('dir', 'R')
-        if direction == 'R':
-            plain, iv_r, n_r = _cfb64(session.P, session.S, raw, iv_r, encrypt=False, n_in=n_r)
-        else:
-            plain, iv_s, n_s = _cfb64(session.P, session.S, raw, iv_s, encrypt=False, n_in=n_s)
-        # Sadece henüz çözülemeyen paketleri güncelle
+
+        plain, _, _ = _cfb64(session.P, session.S, raw, session.iv, encrypt=False, n_in=0)
+
+        # Büyük buffer: sub-paket ayrıştırması dene
+        if ev.get('size', 0) > 258 and status in ('encrypted', 'mismatch', 'proto?', 'large'):
+            subs = _walk_subpackets(plain, raw)
+            if subs:
+                for sub in subs:
+                    sub_ev = fmt_packet(0, ev['dir'],
+                                        sub['sub_raw'], sub['sub_plain'], ev['ts'])
+                    sub_ev['note'] = f'buf:{len(raw)}B @{sub["offset"]} (retro)'
+                    new_packets.append(sub_ev)
+                changed += len(subs)
+                continue  # orijinal büyük event yerine sub-event'ler kullanılır
+
+        # Küçük / ayrıştırılamayan paket — yerinde güncelle
         if status in ('encrypted', 'mismatch', 'proto?'):
             ev['plain_hex']   = plain.hex()
             ev['len_field']   = plain[0] if plain else None
             ev['proto']       = plain[1] if len(plain) > 1 else None
             ev['payload_hex'] = plain[3:67].hex() if len(plain) > 3 else ''
             op_byte           = plain[2] if len(plain) > 2 else None
-            ev['opcode']      = op_byte
-            expected  = (ev['size'] - 3) & 0xFF
-            len_ok    = (ev['len_field'] == expected and ev['size'] <= 258)
-            proto_ok  = (ev['proto'] == 0x0D)
-            if len_ok and proto_ok:        ev['status'] = 'ok'
-            elif proto_ok and not len_ok:  ev['status'] = 'large'
-            elif len_ok and not proto_ok:  ev['status'] = 'proto?'
-            else:                          ev['status'] = 'mismatch'
+            sz        = ev['size']
+            expected  = (sz - 3) & 0xFF
+            len_ok    = (ev['len_field'] == expected)
+            proto_ok  = (ev['proto'] in _VALID_PROTO)
+            alt_proto = (ev['proto'] in (0x0C, 0x0F))
+            if len_ok and proto_ok and (sz <= 258 or alt_proto):
+                ev['status'] = 'ok'
+            elif proto_ok and len_ok:     ev['status'] = 'ok'
+            elif proto_ok:                ev['status'] = 'large'
+            elif len_ok:                  ev['status'] = 'proto?'
+            else:                         ev['status'] = 'mismatch'
             if op_byte is not None:
-                dec = decode_packet(op_byte, plain[3:], ev.get('dir','R'))
+                dec = decode_packet(op_byte, plain[3:], ev.get('dir', 'R'))
                 ev['decoded']   = dec
                 ev['pkt_name']  = dec['name']
                 ev['opcode']    = f"0x{op_byte:02x}"
-            if ev['proto']  is not None:   ev['proto']  = f"0x{ev['proto']:02x}"
+            if ev['proto'] is not None: ev['proto'] = f"0x{ev['proto']:02x}"
             ev['note'] = 'retroaktif çözüldü'
             if ev['status'] != status:
                 changed += 1
-    # Canlı stream durumunu güncelle — sonraki paketler doğru noktadan devam eder
-    session.iv_recv, session.n_recv = iv_r, n_r
-    session.iv_send, session.n_send = iv_s, n_s
+
+        new_packets.append(ev)
+
     if changed:
-        print(f'[REDECRYPT] {changed} paket güncellendi')
+        # Seq numaralarını yeniden ata (expansion sonrası sıra bozulabilir)
+        for i, ev in enumerate(new_packets):
+            ev['seq'] = i
+        session.packets = new_packets
+        session.seq     = len(new_packets)
+        print(f'[REDECRYPT] {changed} event güncellendi → toplam {len(new_packets)} event')
         await broadcast({'type': 'redecrypted', 'packets': session.packets[-500:]})
         await broadcast({'type': 'status',
-                         'msg':   f'✓ Retroaktif çözüm: {changed} paket şifre açıldı',
+                         'msg':   f'✓ Retroaktif çözüm: {changed} event güncellendi',
                          'level': 'ok'})
 
 async def on_dll_frame(data: bytes):
@@ -767,8 +908,16 @@ async def on_dll_frame(data: bytes):
         raw = data[6: 6 + data_len]
         if len(raw) >= 11 and raw[0] == 0xc5:
             new_iv = bytes(raw[3:11])
-            is_new_session = (session.iv != new_iv)  # IV değiştiyse → yeni oyun oturumu
-            session.try_challenge(raw)
+            iv_changed = (session.iv != new_iv)
+
+            # Mevcut paketler varsa skora göre karar ver — çalışan IV'i ezmemek için
+            if session.packets and session.has_key():
+                accepted = session.apply_iv_if_better(new_iv)
+                is_new_session = accepted and iv_changed
+            else:
+                # Henüz paket yok: IV'i doğrudan ata
+                session.try_challenge(raw)
+                is_new_session = iv_changed
 
             if is_new_session:
                 # Yeni oyun oturumu: eski paketler ve log_data temizle
@@ -793,7 +942,9 @@ async def on_dll_frame(data: bytes):
     # Challenge tespiti (tam 202B, 0xc5 ile başlar)
     # ÖNEMLI: boyut kontrolü zorunlu — rastgele şifreli paket 0xc5 ile başlarsa
     # yanlış IV atanır ve tüm akış bozulur (mismatch).
-    if direction == 'R' and len(raw) == 202 and session.try_challenge(raw):
+    if direction == 'R' and len(raw) == 202 and len(raw) >= 11 and raw[0] == 0xc5:
+        new_iv = bytes(raw[3:11])
+        session.apply_iv_if_better(new_iv)   # apply_iv_if_better: çalışan IV'i ezmez
         ev = fmt_packet(session.seq, 'R', raw, None, ts)
         ev['status'] = 'challenge'
         ev['note']   = f'IV={session.iv.hex()}'
@@ -808,7 +959,21 @@ async def on_dll_frame(data: bytes):
         return
 
     plain = session.decrypt(raw, direction)
-    ev    = fmt_packet(session.seq, direction, raw, plain, ts)
+
+    # Büyük buffer: birden fazla game sub-paketi içerebilir — ayır
+    if plain is not None and len(raw) > 258:
+        subs = _walk_subpackets(plain, raw)
+        if subs:
+            for sub in subs:
+                ev = fmt_packet(session.seq, direction,
+                                sub['sub_raw'], sub['sub_plain'], ts)
+                ev['note'] = f'buf:{len(raw)}B @{sub["offset"]}'
+                session.seq += 1
+                _store(ev)
+                await broadcast({'type': 'packet', 'pkt': ev})
+            return
+
+    ev = fmt_packet(session.seq, direction, raw, plain, ts)
     session.seq += 1
     _store(ev)
     await broadcast({'type': 'packet', 'pkt': ev})
@@ -1530,13 +1695,13 @@ function doInject() {
 # ─── Log replay ──────────────────────────────────────────────────────────────
 
 _NET_LINE = re.compile(
-    r'\[(\d{2}:\d{2}:\d{2})'       # timestamp HH:MM:SS
-    r'[^\]]*\]\s+TCP\s+'
+    r'(?:\[(\d{2}:\d{2}:\d{2})[^\]]*\]\s+)?'   # timestamp — opsiyonel (bazı satırlarda eksik)
+    r'TCP\s+'
     r'(RECV|SEND)\s+[←→]\s+'
-    r'(\S+)\s+'                     # IP:port
+    r'(\S+)\s+'                                  # IP:port
     r'bf_calls=\d+\s+'
-    r'\[(\d+) bytes\]:\s+'
-    r'([0-9a-fA-F]+)'               # hex (may be truncated)
+    r'\[(\d+)\s+bytes\]:\s*'
+    r'([0-9a-fA-F]+)'                            # hex (truncated olabilir)
 )
 _GAME_PORT = '39190'
 
@@ -1555,11 +1720,11 @@ def parse_netlog(path: str):
                 size = int(size_str)
                 raw  = bytes.fromhex(hex_data)
                 pkts.append({
-                    'ts':   ts,
+                    'ts':   ts or '',             # ts opsiyonel — yoksa boş string
                     'dir':  'R' if direction == 'RECV' else 'S',
                     'size': size,
-                    'raw':  raw,                  # first ≤128 bytes
-                    'full': len(raw) >= size,     # no truncation?
+                    'raw':  raw,                  # first ≤128 bytes (log kısaltıyor)
+                    'full': len(raw) >= size,     # truncation yok mu?
                 })
     except OSError:
         pass
@@ -1580,44 +1745,43 @@ async def replay_handler(request):
     session.packets.clear()
     session.seq = 0
 
-    # Replay için yön başına bağımsız CFB akış durumu
-    rp_iv_r = rp_iv_s = session.iv  # mevcut IV'den başla (challenge bulunana kadar)
-    rp_n_r  = rp_n_s  = 0
-
     evs = []
     for p in pkts:
-        raw, direction, ts, size = p['raw'], p['dir'], p['ts'], p['size']
+        raw       = p['raw']
+        direction = p['dir']
+        ts        = p['ts'] or time.strftime('%H:%M:%S')
+        size      = p['size']
 
-        # Challenge tespiti — yeni IV + akışları sıfırla
+        # Challenge tespiti — IV güncelle (apply_iv_if_better: çalışan IV'i korur)
         if direction == 'R' and size == 202 and len(raw) >= 11 and raw[0] == 0xc5:
-            new_iv = bytes(raw[3:11])
-            rp_iv_r = rp_iv_s = new_iv
-            rp_n_r  = rp_n_s  = 0
-            session.set_iv(new_iv)     # session IV'ini de set_iv() ile güncelle
+            session.apply_iv_if_better(bytes(raw[3:11]))
             ev = fmt_packet(session.seq, 'R', raw, None, ts)
             ev['status'] = 'challenge'
-            ev['note']   = f'IV={new_iv.hex()} (log)'
-        else:
-            plain = None
-            if session.P and session.S and rp_iv_r and p['full']:
-                # Stateful CFB: yön başına akış durumu korunur
-                if direction == 'R':
-                    plain, rp_iv_r, rp_n_r = _cfb64(
-                        session.P, session.S, raw, rp_iv_r, encrypt=False, n_in=rp_n_r)
-                else:
-                    plain, rp_iv_s, rp_n_s = _cfb64(
-                        session.P, session.S, raw, rp_iv_s, encrypt=False, n_in=rp_n_s)
-            ev = fmt_packet(session.seq, direction, raw, plain, ts)
-            if not p['full'] and ev['status'] not in ('ok', 'large', 'challenge'):
-                ev['status'] = 'truncated'
-                ev['note']   = f'log kısaltılmış ({len(raw)}/{size}B)'
-        session.seq += 1
-        _store(ev)
-        evs.append(ev)
+            ev['note']   = f'IV={session.iv.hex()} (log)'
+            session.seq += 1; _store(ev); evs.append(ev)
+            continue
 
-    # Replay bitti — canlı akış durumunu sync et
-    session.iv_recv, session.n_recv = rp_iv_r, rp_n_r
-    session.iv_send, session.n_send = rp_iv_s, rp_n_s
+        plain = None
+        if session.P and session.S and session.iv and p['full']:
+            plain, _, _ = _cfb64(session.P, session.S, raw, session.iv,
+                                  encrypt=False, n_in=0)
+
+        # Büyük tampon: sub-paket ayrıştırması
+        if plain is not None and size > 258:
+            subs = _walk_subpackets(plain, raw)
+            if subs:
+                for sub in subs:
+                    ev = fmt_packet(session.seq, direction,
+                                    sub['sub_raw'], sub['sub_plain'], ts)
+                    ev['note'] = f'buf:{size}B @{sub["offset"]} (log)'
+                    session.seq += 1; _store(ev); evs.append(ev)
+                continue  # büyük buffer'ı tekil event olarak ekleme
+
+        ev = fmt_packet(session.seq, direction, raw, plain, ts)
+        if not p['full'] and ev['status'] not in ('ok', 'large', 'challenge'):
+            ev['status'] = 'truncated'
+            ev['note']   = f'log kısaltılmış ({len(raw)}/{size}B)'
+        session.seq += 1; _store(ev); evs.append(ev)
 
     # Tüm istemcilere gönder
     await broadcast({'type': 'cleared'})
