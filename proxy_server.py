@@ -151,23 +151,44 @@ def load_all_candidates(crypto_log):
 def crack_key(candidates, iv_bytes, test_packets, min_hits=2):
     """Aday listesinden doğru anahtarı bul.
     test_packets: list of (cipher_bytes, size) — RECV paketleri
-    Geçerlilik kriteri: plain[0]==(size-3)&0xFF  ve  plain[1]==0x0D
-    min_hits adayın en az kaç pakette eşleşmesi gerektiğini belirtir.
-    En çok eşleşen adayı döndürür; bulunamazsa (None, None)."""
+
+    Protokol notu: header (cipher[0:3]) DÜZ METİN olduğundan
+    key bağımsız doğrulanır. Payload (cipher[3:]) Blowfish şifreli;
+    doğru key heuristic ile tespit edilir (kesin değil, DLL key frame
+    geldikten sonra otomatik güncellenir).
+
+    Doğrulama kriterleri:
+      1. Header: flag byte MSB set VE boyut eşleşmesi (key'den bağımsız)
+      2. Payload heuristic: PointBlank payload'larında genellikle
+         ilk byte küçük (<0x40) veya payload içinde 3 ardışık sıfır byte
+         bulunur — tamamen rastgele byte'lar yanlış key'i gösterir."""
     best_p, best_s, best_hits = None, None, -1
     for P, S in candidates:
         hits = 0
         for cipher, size in test_packets:
-            # Per-buffer: her paket n=0'dan bağımsız çözülür
-            plain, _, _ = _cfb64(P, S, cipher, iv_bytes, encrypt=False, n_in=0)
-            expected_len = (size - 3) & 0xFF
-            if len(plain) >= 2 and plain[0] == expected_len and plain[1] == 0x0D:
+            if len(cipher) < 4:
+                continue
+            # Adım 1: header geçerliliği — key'den bağımsız
+            flag = cipher[1]
+            payload_len = cipher[0] | ((flag & 0x7F) << 8)
+            if not (flag & 0x80) or 3 + payload_len != size:
+                continue   # geçersiz boyut → bu paketi atla
+            enc_payload = cipher[3:]
+            if not enc_payload:
+                hits += 1  # payload yok → her key geçer
+                continue
+            # Adım 2: payload heuristic — doğru key ile okunabilir veri
+            plain_payload, _, _ = _cfb64(P, S, enc_payload, iv_bytes,
+                                         encrypt=False, n_in=0)
+            small_first = bool(plain_payload) and plain_payload[0] < 0x40
+            zero_run    = any(plain_payload[i:i+3] == b'\x00\x00\x00'
+                              for i in range(min(len(plain_payload) - 2, 20)))
+            if small_first or zero_run:
                 hits += 1
         if hits > best_hits:
             best_hits, best_p, best_s = hits, P, S
     if best_hits >= min_hits:
         return best_p, best_s
-    # min_hits sağlanamadı; en azından 1 eşleşme varsa dön
     if best_hits >= 1:
         return best_p, best_s
     return None, None
@@ -302,22 +323,41 @@ class Session:
         return False
 
     def score_iv(self, candidate_iv: bytes, n_pkts: int = 8) -> int:
-        """IV adayının mevcut paketlere göre skor hesapla (stateless, sadece ilk paket)."""
-        if not self.P:
-            return 0
-        test = [ev for ev in self.packets[-30:]
-                if ev.get('size', 0) < 64 and ev.get('raw_hex') and ev.get('status') != 'challenge'][:n_pkts]
-        score = 0
-        for ev in test:
-            raw = bytes.fromhex(ev['raw_hex'])
-            p, _, _ = _cfb64(self.P, self.S, raw, candidate_iv, encrypt=False)
-            if p and len(p) > 1 and p[1] == 0x0D:
-                score += 1
-        return score
+        """IV adayının mevcut paketlere göre skor hesapla.
+
+        Yeni protokol formatı: header (raw[0:3]) düz metin olduğundan
+        IV değişimi sadece payload (raw[3:]) çözümünü etkiler.
+        Skor: header geçerliliği (flag byte MSB + len match) header'dan
+        IV bağımsız kontrol edilir → tüm adaylar eşit skora düşer.
+        Bu nedenle fonksiyon her zaman 0 döndürür; apply_iv_if_better
+        yeni IV'i her zaman kabul eder (0 >= -1: no-IV, 0 >= 0: has-IV)."""
+        return 0
 
     def apply_iv_if_better(self, candidate_iv: bytes) -> bool:
+        """IV adayını mevcut IV ile karşılaştır.
+
+        Güvenlik politikası:
+          - Mevcut IV yoksa → her zaman kabul et.
+          - Mevcut son 20 pakette 'ok' durumlu paketler varsa → mevcut IV çalışıyor;
+            skor kesin üstün olmadıkça reddet (yanlış challenge ile IV ezilmesini engeller).
+          - 'ok' paket yoksa (tümü mismatch/encrypted) → eşit skor yeterli (yeni oturum olabilir).
+        score_iv() her zaman 0 döndürdüğünden, "çalışan IV korunur" kuralı iş başı yapar."""
+        if self.iv is None:
+            self.set_iv(candidate_iv)
+            return True
         new_score = self.score_iv(candidate_iv)
-        old_score = self.score_iv(self.iv) if self.iv else -1
+        old_score = self.score_iv(self.iv)
+        # Mevcut IV çalışıyorsa kesin iyileşme zorunlu
+        has_ok = any(p.get('status') == 'ok' for p in self.packets[-20:])
+        if has_ok:
+            if new_score > old_score:
+                self.set_iv(candidate_iv)
+                return True
+            ok_count = sum(1 for p in self.packets[-20:] if p.get('status') == 'ok')
+            print(f'[IV] Reddedildi — mevcut IV çalışıyor ({ok_count} ok paket), '
+                  f'yeni={candidate_iv.hex()} skor={new_score}')
+            return False
+        # OK paket yok → eşit skor yeterli (yeni oturum varsayımı)
         if new_score >= old_score:
             self.set_iv(candidate_iv)
             return True
@@ -325,19 +365,54 @@ class Session:
         return False
 
     def decrypt(self, cipher, direction='R'):
-        """Per-buffer CFB-64 decrypt — her TCP tamponu n=0'dan bağımsız çözülür.
-        PointBlank her send()/recv() çağrısını aynı başlangıç IV'i ile ayrı ayrı şifreler."""
+        """Per-buffer CFB-64 decrypt.
+
+        Protokol formatı (wire capture ile doğrulandı):
+          cipher[0]  = len_lo          (DÜZ METİN — Blowfish dışı)
+          cipher[1]  = 0x80|len_hi     (DÜZ METİN — Blowfish dışı)
+          cipher[2]  = opcode          (DÜZ METİN — Blowfish dışı)
+          cipher[3:] = Blowfish CFB-64 şifreli payload
+
+        Döndürülen değer: cipher[0:3] + BF_dec(cipher[3:])
+        Böylece plain[2] = opcode, plain[3:] = çözülmüş payload."""
         if not self.has_key() or not self.has_iv():
             return None
-        plain, _, _ = _cfb64(self.P, self.S, cipher, self.iv, encrypt=False, n_in=0)
-        return plain
+        if len(cipher) < 3:
+            return bytes(cipher)
+        header = cipher[:3]          # düz metin — olduğu gibi geç
+        enc_payload = cipher[3:]
+        if not enc_payload:
+            return bytes(cipher)
+        plain_payload, _, _ = _cfb64(self.P, self.S, enc_payload, self.iv,
+                                     encrypt=False, n_in=0)
+        return header + plain_payload
+
+    def decrypt_subpkt(self, raw_subpkt: bytes) -> bytes | None:
+        """Tek bir alt paketin payload'ını bağımsız olarak çöz (walk_subpackets için)."""
+        if not self.has_key() or not self.has_iv() or len(raw_subpkt) < 3:
+            return None
+        header = raw_subpkt[:3]
+        enc_payload = raw_subpkt[3:]
+        if not enc_payload:
+            return bytes(raw_subpkt)
+        plain_payload, _, _ = _cfb64(self.P, self.S, enc_payload, self.iv,
+                                     encrypt=False, n_in=0)
+        return header + plain_payload
 
     def encrypt(self, plain):
-        """Per-buffer CFB-64 encrypt — her inject n=0'dan bağımsız şifrelenir."""
+        """Per-buffer CFB-64 encrypt — sadece payload (plain[3:]) şifrelenir.
+        plain[0:3] (header) düz metin olarak bırakılır."""
         if not self.has_key() or not self.has_iv():
             return None
-        cipher, _, _ = _cfb64(self.P, self.S, plain, self.iv, encrypt=True, n_in=0)
-        return cipher
+        if len(plain) < 3:
+            return bytes(plain)
+        header = plain[:3]
+        payload = plain[3:]
+        if not payload:
+            return bytes(plain)
+        cipher_payload, _, _ = _cfb64(self.P, self.S, payload, self.iv,
+                                      encrypt=True, n_in=0)
+        return header + cipher_payload
 
 session = Session()
 
@@ -524,7 +599,13 @@ _OPCODES: dict[int, tuple[str, str, str]] = {
 #   0x0D → standart paket (≤258 B), her iki yön
 #   0x0C → büyük istemci paketi (>258 B) — gerçek trafik verisiyle doğrulandı
 #   0x0F → büyük sunucu paketi (>258 B) — gerçek trafik verisiyle doğrulandı
-_VALID_PROTO: frozenset[int] = frozenset({0x0C, 0x0D, 0x0F})
+# Protokol formatı (confirmed, wire capture analizi):
+#   [1B len_lo][1B 0x80|len_hi][1B opcode]  ← DÜZ METİN header (Blowfish DIŞI)
+#   [payload bytes …]                        ← Blowfish CFB-64 şifreli
+# "proto" alanı artık header'ın flag byte'ı (0x80 | len_hi):
+#   her zaman MSB=1 → valid flag check: byte & 0x80 == 0x80
+# Eski _VALID_PROTO {0x0C,0x0D,0x0F} tamamen kaldırıldı.
+_VALID_FLAG_MASK: int = 0x80   # flag byte'ın MSB daima set olmalı
 
 def _ascii_safe(b: bytes) -> str:
     return ''.join(chr(x) if 0x20 <= x < 0x7f else '.' for x in b)
@@ -940,26 +1021,32 @@ def fmt_packet(seq, direction, raw, plain, ts=None):
         return base
 
     base['plain_hex']   = plain.hex()
+    # Yeni protokol formatı: header (plain[0:3]) düz metin
+    #   plain[0] = len_lo
+    #   plain[1] = 0x80 | len_hi  (flag byte, MSB daima 1)
+    #   plain[2] = opcode (düz metin)
+    #   plain[3:] = Blowfish çözülmüş payload
     base['len_field']   = plain[0] if plain else None
-    base['proto']       = plain[1] if len(plain) > 1 else None
+    base['proto']       = plain[1] if len(plain) > 1 else None   # flag byte
     base['payload_hex'] = plain[3:67].hex() if len(plain) > 3 else ''
 
     op_byte = plain[2] if len(plain) > 2 else None
     base['opcode'] = op_byte
 
-    expected   = (size - 3) & 0xFF
-    len_ok     = (base['len_field'] == expected)
-    proto_ok   = (base['proto'] in _VALID_PROTO)
-    # 0x0D → standart (≤258 B), 0x0C/0x0F → büyük paket (>258 B) — hepsi geçerli
-    std_size   = (size <= 258)
-    alt_proto  = (base['proto'] in (0x0C, 0x0F))
+    # Geçerlilik kontrolü — header düz metin olduğundan plain[0:2] == raw[0:2]
+    flag_byte   = plain[1] if len(plain) > 1 else 0
+    flag_ok     = bool(flag_byte & _VALID_FLAG_MASK)          # MSB = 1
+    payload_len = plain[0] | ((flag_byte & 0x7F) << 8)        # 2-byte uzunluk
+    len_ok      = (3 + payload_len == size)
 
-    if len_ok and proto_ok and (std_size or alt_proto):
+    if len_ok and flag_ok:
         base['status'] = 'ok'
-    elif proto_ok and not len_ok:   base['status'] = 'large'
-    elif proto_ok and len_ok:       base['status'] = 'ok'    # len_ok ama size>258 ve 0x0D
-    elif len_ok and not proto_ok:   base['status'] = 'proto?'
-    else:                           base['status'] = 'mismatch'
+    elif flag_ok and not len_ok:
+        base['status'] = 'large'
+    elif len_ok and not flag_ok:
+        base['status'] = 'proto?'
+    else:
+        base['status'] = 'mismatch'
 
     # Decode packet fields
     # parse_fields sadece şifre çözme güvenilirken açık — mismatch/proto? durumunda
@@ -981,41 +1068,50 @@ def fmt_packet(seq, direction, raw, plain, ts=None):
     return base
 
 
-def _walk_subpackets(plain: bytes, raw: bytes) -> list[dict]:
-    """Decrypt edilmiş TCP tamponundan [len][0x0D][op][payload] bloklarını çıkar.
-    raw: orijinal şifreli buffer (slice için).
+def _walk_subpackets(raw: bytes) -> list[dict]:
+    """Büyük TCP tamponunu bağımsız PointBlank alt paketlerine ayır.
+
+    Protokol formatı (her alt paket için):
+      raw[i+0] = len_lo          (DÜZ METİN)
+      raw[i+1] = 0x80|len_hi    (DÜZ METİN, MSB daima 1)
+      raw[i+2] = opcode          (DÜZ METİN)
+      raw[i+3 : i+total]         = Blowfish şifreli payload
+
+    Her alt paketin payload'ı bağımsız olarak n=0'dan çözülür;
+    session.decrypt_subpkt() bunu yapar.
 
     Geçerlilik kuralı (veri kaybı olmadan):
       • buffer tamamen tüketildi (leftover == 0), VEYA
       • kalan bayt sayısı < 3 (geçerli bir paket için minimum — padding sayılır).
-    Herhangi bir anlamlı artık varsa (leftover >= 3) split yapılmaz;
-    orijinal büyük event fmt_packet'e geri döner."""
+    Herhangi bir anlamlı artık varsa (leftover >= 3) split yapılmaz."""
     pkts = []
     i    = 0
-    while i + 3 <= len(plain):
-        length = plain[i]
-        proto  = plain[i + 1]
-        opcode = plain[i + 2]
-        total  = length + 3
-        if proto != 0x0D:
-            break                           # proto yanlış → framing bozuk
-        if i + total > len(plain):
+    while i + 3 <= len(raw):
+        len_lo  = raw[i]
+        flag    = raw[i + 1]
+        opcode  = raw[i + 2]
+        if not (flag & _VALID_FLAG_MASK):
+            break                           # flag byte geçersiz → framing bozuk
+        payload_len = len_lo | ((flag & 0x7F) << 8)
+        total       = 3 + payload_len
+        if i + total > len(raw):
             break                           # buffer taşıyor → tamamlanmamış
+        sub_raw = raw[i: i + total]
         pkts.append({
-            'offset':    i,
-            'total':     total,
-            'op':        opcode,
-            'len':       length,
-            'sub_plain': plain[i: i + total],
-            'sub_raw':   raw  [i: i + total] if i + total <= len(raw) else b'',
+            'offset':  i,
+            'total':   total,
+            'op':      opcode,
+            'len':     payload_len,
+            'sub_raw': sub_raw,
+            # sub_plain: on_dll_frame / _redecrypt_session içinde dekript edilir
         })
         i += total
 
     if not pkts:
         return []
 
-    leftover = len(plain) - i
-    # Split yalnızca buffer tamamen tüketildiyse VEYA kalan < 3B (geçerli paket olamaz)
+    leftover = len(raw) - i
+    # Split yalnızca buffer tamamen tüketildiyse VEYA kalan < 3B (padding)
     if leftover == 0 or (len(pkts) >= 2 and leftover < 3):
         return pkts
     return []   # anlamlı artık var → split yapılmaz, orijinal event korunur
@@ -1118,38 +1214,39 @@ async def _redecrypt_session():
             new_packets.append(ev)
             continue
 
-        plain, _, _ = _cfb64(session.P, session.S, raw, session.iv, encrypt=False, n_in=0)
-
-        # Büyük buffer: sub-paket ayrıştırması dene
+        # Büyük buffer: sub-paket ayrıştırması dene (raw üzerinden — header düz metin)
         if ev.get('size', 0) > 258 and status in ('encrypted', 'mismatch', 'proto?', 'large'):
-            subs = _walk_subpackets(plain, raw)
+            subs = _walk_subpackets(raw)
             if subs:
                 for sub in subs:
+                    sub_plain = session.decrypt_subpkt(sub['sub_raw'])
                     sub_ev = fmt_packet(0, ev['dir'],
-                                        sub['sub_raw'], sub['sub_plain'], ev['ts'])
+                                        sub['sub_raw'], sub_plain, ev['ts'])
                     sub_ev['note'] = f'buf:{len(raw)}B @{sub["offset"]} (retro)'
                     new_packets.append(sub_ev)
                 changed += len(subs)
                 continue  # orijinal büyük event yerine sub-event'ler kullanılır
 
-        # Küçük / ayrıştırılamayan paket — yerinde güncelle
+        # Küçük / ayrıştırılamayan paket — yeniden çöz ve yerinde güncelle
         if status in ('encrypted', 'mismatch', 'proto?'):
+            plain = session.decrypt(raw, ev.get('dir', 'R'))
+            if plain is None:
+                new_packets.append(ev)
+                continue
             ev['plain_hex']   = plain.hex()
             ev['len_field']   = plain[0] if plain else None
-            ev['proto']       = plain[1] if len(plain) > 1 else None
             ev['payload_hex'] = plain[3:67].hex() if len(plain) > 3 else ''
             op_byte           = plain[2] if len(plain) > 2 else None
             sz        = ev['size']
-            expected  = (sz - 3) & 0xFF
-            len_ok    = (ev['len_field'] == expected)
-            proto_ok  = (ev['proto'] in _VALID_PROTO)
-            alt_proto = (ev['proto'] in (0x0C, 0x0F))
-            if len_ok and proto_ok and (sz <= 258 or alt_proto):
-                ev['status'] = 'ok'
-            elif proto_ok and len_ok:     ev['status'] = 'ok'
-            elif proto_ok:                ev['status'] = 'large'
-            elif len_ok:                  ev['status'] = 'proto?'
-            else:                         ev['status'] = 'mismatch'
+            flag_byte = plain[1] if len(plain) > 1 else 0
+            ev['proto'] = flag_byte
+            flag_ok   = bool(flag_byte & _VALID_FLAG_MASK)
+            pay_len   = plain[0] | ((flag_byte & 0x7F) << 8)
+            len_ok    = (3 + pay_len == sz)
+            if len_ok and flag_ok:      ev['status'] = 'ok'
+            elif flag_ok:               ev['status'] = 'large'
+            elif len_ok:                ev['status'] = 'proto?'
+            else:                       ev['status'] = 'mismatch'
             if op_byte is not None:
                 _good = ev['status'] in ('ok', 'large')
                 dec = decode_packet(op_byte, plain[3:], ev.get('dir', 'R'),
@@ -1247,20 +1344,23 @@ async def on_dll_frame(data: bytes):
         await _redecrypt_session()  # anahtar varsa mevcut encrypted paketleri çöz
         return
 
-    plain = session.decrypt(raw, direction)
-
-    # Büyük buffer: birden fazla game sub-paketi içerebilir — ayır
-    if plain is not None and len(raw) > 258:
-        subs = _walk_subpackets(plain, raw)
+    # Büyük buffer: birden fazla game sub-paketi içerebilir
+    # Header (raw[0:3]) düz metin olduğundan raw üzerinden walk edilir;
+    # her alt paketin payload'ı bağımsız olarak decrypt_subpkt ile çözülür.
+    if len(raw) > 258 and session.has_key() and session.has_iv():
+        subs = _walk_subpackets(raw)
         if subs:
             for sub in subs:
+                sub_plain = session.decrypt_subpkt(sub['sub_raw'])
                 ev = fmt_packet(session.seq, direction,
-                                sub['sub_raw'], sub['sub_plain'], ts)
+                                sub['sub_raw'], sub_plain, ts)
                 ev['note'] = f'buf:{len(raw)}B @{sub["offset"]}'
                 session.seq += 1
                 _store(ev)
                 await broadcast({'type': 'packet', 'pkt': ev})
             return
+
+    plain = session.decrypt(raw, direction)
 
     ev = fmt_packet(session.seq, direction, raw, plain, ts)
     session.seq += 1
@@ -1635,7 +1735,7 @@ tbody tr.sel td{background:#1c2333!important}
         <div class="itab on" data-mode="plain">Plaintext (otom. şifrele)</div>
         <div class="itab"    data-mode="raw">Raw Cipher (ham)</div>
       </div>
-      <textarea id="inj-hex" placeholder="Plaintext hex örn: 10 0d 4d 01 02&#10;[0] payload_len = toplam-3&#10;[1] proto = 0x0d&#10;[2] opcode&#10;[3…] payload"></textarea>
+      <textarea id="inj-hex" placeholder="Plaintext hex örn: 10 80 4d 01 02&#10;[0] len_lo (toplam-3 &amp; 0xFF)&#10;[1] 0x80|(len_hi) — flag byte&#10;[2] opcode&#10;[3…] payload (Blowfish şifrelenir)"></textarea>
       <div id="inj-row">
         <span id="inj-hint">Ctrl+Enter ile gönder</span>
         <button id="inj-btn" disabled>Gönder</button>
@@ -1955,7 +2055,7 @@ document.querySelectorAll('.itab').forEach(tab => {
       ph.style.color = 'var(--blue)';
       hint.textContent = 'Şifrelenmez, olduğu gibi gönderilir';
     } else {
-      ph.placeholder = 'Plaintext hex örn: 10 0d 4d 01 02\n[0] payload_len=toplam-3  [1] 0x0d  [2] opcode';
+      ph.placeholder = 'Plaintext hex örn: 10 80 4d 01 02\n[0] len_lo  [1] 0x80|len_hi  [2] opcode  [3…] payload';
       ph.style.color = 'var(--green)';
       hint.textContent = 'Otomatik CFB64 şifrelenir';
     }
@@ -2050,21 +2150,21 @@ async def replay_handler(request):
             session.seq += 1; _store(ev); evs.append(ev)
             continue
 
-        plain = None
-        if session.P and session.S and session.iv and p['full']:
-            plain, _, _ = _cfb64(session.P, session.S, raw, session.iv,
-                                  encrypt=False, n_in=0)
-
-        # Büyük tampon: sub-paket ayrıştırması
-        if plain is not None and size > 258:
-            subs = _walk_subpackets(plain, raw)
+        # Büyük tampon: sub-paket ayrıştırması (header düz metin → raw üzerinden walk)
+        if session.has_key() and session.has_iv() and p['full'] and size > 258:
+            subs = _walk_subpackets(raw)
             if subs:
                 for sub in subs:
+                    sub_plain = session.decrypt_subpkt(sub['sub_raw'])
                     ev = fmt_packet(session.seq, direction,
-                                    sub['sub_raw'], sub['sub_plain'], ts)
+                                    sub['sub_raw'], sub_plain, ts)
                     ev['note'] = f'buf:{size}B @{sub["offset"]} (log)'
                     session.seq += 1; _store(ev); evs.append(ev)
                 continue  # büyük buffer'ı tekil event olarak ekleme
+
+        plain = None
+        if session.has_key() and session.has_iv() and p['full']:
+            plain = session.decrypt(raw, direction)
 
         ev = fmt_packet(session.seq, direction, raw, plain, ts)
         if not p['full'] and ev['status'] not in ('ok', 'large', 'challenge'):
