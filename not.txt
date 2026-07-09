@@ -1,1 +1,2 @@
-Replit ortamında dll bluid i zig ile yap.
+proxy_server.py proxy serveri aktif et 
+isteğe göre Replit ortamında dll bluid i zig ile yap.
