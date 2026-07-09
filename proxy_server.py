@@ -12,6 +12,9 @@ import asyncio, json, struct, re, time, argparse, glob, os
 from aiohttp import web
 import aiohttp
 
+# ── Yetkili DLL token — SESSION_SECRET env değişkeninden okunur ──────────────
+PROXY_TOKEN: str = os.environ.get('SESSION_SECRET', '')
+
 # ─── Blowfish (PointBlank özel varyant: per-round swap YOK) ──────────────────
 
 def _bf_enc(P, S, L, R):
@@ -280,6 +283,10 @@ class Session:
         self.ui_clients = set()
         self.packets   = []
         self.seq       = 0
+        # ── Intercept modu ──────────────────────────────────────────────────
+        self.intercept_mode: bool = False
+        self.intercept_dir_mask: int = 3   # bit0=SEND bit1=RECV
+        self.pending_intercepts: dict[int, asyncio.Future] = {}
 
     @property
     def dll_ws(self):
@@ -323,45 +330,78 @@ class Session:
         return False
 
     def score_iv(self, candidate_iv: bytes, n_pkts: int = 8) -> int:
-        """IV adayının mevcut paketlere göre skor hesapla.
+        """Son RECV paketlerini candidate_iv ile çözüp doğrulayan paket sayısını döndür.
 
-        Yeni protokol formatı: header (raw[0:3]) düz metin olduğundan
-        IV değişimi sadece payload (raw[3:]) çözümünü etkiler.
-        Skor: header geçerliliği (flag byte MSB + len match) header'dan
-        IV bağımsız kontrol edilir → tüm adaylar eşit skora düşer.
-        Bu nedenle fonksiyon her zaman 0 döndürür; apply_iv_if_better
-        yeni IV'i her zaman kabul eder (0 >= -1: no-IV, 0 >= 0: has-IV)."""
-        return 0
+        Protokol: cipher[0:3] düz metin, cipher[3:] CFB-64 şifreli payload.
+        Geçerli çözümde sub-paket flag byte'ı (dec[1]) MSB=1 taşımalı.
+        Bu test IV'e duyarlıdır çünkü payload şifreli — yanlış IV rastgele
+        baytlar üretir ve MSB=1 testi ~%50 oranında geçer.
+        Doğru IV → tüm paketler geçer; yanlış IV → yaklaşık yarısı geçer."""
+        if not self.has_key() or not candidate_iv:
+            return 0
+        score = 0
+        test_pkts = [
+            p for p in self.packets[-40:]
+            if p.get('raw_hex') and p.get('dir') == 'R' and p.get('size', 0) > 3
+        ][-n_pkts:]
+        for p in test_pkts:
+            try:
+                raw = bytes.fromhex(p['raw_hex'])
+                if len(raw) <= 3:
+                    continue
+                dec, _, _ = _cfb64(self.P, self.S, raw[3:], candidate_iv,
+                                   encrypt=False, n_in=0)
+                # Sub-paket flag byte MSB=1 testi
+                if len(dec) >= 2 and (dec[1] & 0x80):
+                    score += 1
+            except Exception:
+                pass
+        return score
 
     def apply_iv_if_better(self, candidate_iv: bytes) -> bool:
         """IV adayını mevcut IV ile karşılaştır.
 
-        Güvenlik politikası:
-          - Mevcut IV yoksa → her zaman kabul et.
-          - Mevcut son 20 pakette 'ok' durumlu paketler varsa → mevcut IV çalışıyor;
-            skor kesin üstün olmadıkça reddet (yanlış challenge ile IV ezilmesini engeller).
-          - 'ok' paket yoksa (tümü mismatch/encrypted) → eşit skor yeterli (yeni oturum olabilir).
-        score_iv() her zaman 0 döndürdüğünden, "çalışan IV korunur" kuralı iş başı yapar."""
+        Politika:
+          - IV yoksa → her zaman kabul et.
+          - Aynı IV → değişiklik yok.
+          - Son paketler tutarsız (hepsi mismatch/encrypted) → mevcut IV bozuk;
+            yeni challenge gelmiş demektir (reconnect) → kabul et.
+          - score_iv > mevcut → daha iyi IV → kabul et.
+          - Aksi hâlde mevcut IV çalışıyorsa koru."""
         if self.iv is None:
             self.set_iv(candidate_iv)
             return True
+        if self.iv == candidate_iv:
+            return False  # değişiklik yok
+
+        # Reconnect tespiti: son 5+ paket hepsi başarısız → IV değişti
+        recent = self.packets[-8:] if self.packets else []
+        iv_failing = (len(recent) >= 5 and
+                      all(p.get('status') in ('mismatch', 'encrypted', None)
+                          for p in recent))
+        if iv_failing:
+            print(f'[IV] Reconnect: son {len(recent)} paket başarısız → yeni IV kabul edildi')
+            self.set_iv(candidate_iv)
+            return True
+
         new_score = self.score_iv(candidate_iv)
         old_score = self.score_iv(self.iv)
-        # Mevcut IV çalışıyorsa kesin iyileşme zorunlu
+
         has_ok = any(p.get('status') == 'ok' for p in self.packets[-20:])
         if has_ok:
             if new_score > old_score:
                 self.set_iv(candidate_iv)
                 return True
             ok_count = sum(1 for p in self.packets[-20:] if p.get('status') == 'ok')
-            print(f'[IV] Reddedildi — mevcut IV çalışıyor ({ok_count} ok paket), '
-                  f'yeni={candidate_iv.hex()} skor={new_score}')
+            print(f'[IV] Reddedildi — mevcut IV çalışıyor ({ok_count} ok), '
+                  f'yeni={candidate_iv.hex()} skor={new_score} eski={old_score}')
             return False
-        # OK paket yok → eşit skor yeterli (yeni oturum varsayımı)
+
+        # OK paket yok → eşit skor yeterli
         if new_score >= old_score:
             self.set_iv(candidate_iv)
             return True
-        print(f'[IV] Reddedildi {candidate_iv.hex()} (skor {new_score}) < mevcut {self.iv.hex()} (skor {old_score})')
+        print(f'[IV] Reddedildi — skor {new_score} < mevcut {old_score}')
         return False
 
     def decrypt(self, cipher, direction='R'):
@@ -1135,6 +1175,13 @@ def _clear_log_data():
         print(f'[SESSION] Eski log dosyaları silindi: {", ".join(deleted)}')
 
 async def dll_handler(request):
+    # ── Token doğrulama (SESSION_SECRET) ──────────────────────────────────
+    if PROXY_TOKEN:
+        auth = request.headers.get('Authorization', '')
+        token = auth.removeprefix('Bearer ').strip()
+        if token != PROXY_TOKEN:
+            return web.Response(status=401, text='Unauthorized')
+
     # heartbeat=None — WinHTTP PING/PONG'u protokol seviyesinde kendisi yönetir;
     # sunucu taraflı heartbeat WinHttpWebSocketReceive'i bozup bağlantıyı kesebilir.
     # Replit proxy idle timeout için uygulama seviyesinde keepalive kullanıyoruz.
@@ -1155,7 +1202,7 @@ async def dll_handler(request):
     try:
         async for msg in ws:
             if msg.type == aiohttp.WSMsgType.BINARY:
-                await on_dll_frame(msg.data)
+                await on_dll_frame(ws, msg.data)
             elif msg.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.ERROR):
                 break
     finally:
@@ -1273,8 +1320,9 @@ async def _redecrypt_session():
                          'msg':   f'✓ Retroaktif çözüm: {changed} event güncellendi',
                          'level': 'ok'})
 
-async def on_dll_frame(data: bytes):
-    """DLL'den gelen binary frame: [1B type][1B dir][4B len LE][...data...]"""
+async def on_dll_frame(dll_ws, data: bytes):
+    """DLL'den gelen binary frame: [1B type][1B dir][4B len LE][...data...]
+    dll_ws: isteği gönderen spesifik DLL WebSocket'i (ACK yanıtı buraya gider)."""
     if len(data) < 6:
         return
     pkt_type  = data[0]      # 'P'=0x50 'K'=0x4B 'C'=0x43
@@ -1287,6 +1335,54 @@ async def on_dll_frame(data: bytes):
     # KEY frame: DLL bellek taramasında anahtar bulunca otomatik gönderir
     if pkt_type == 0x4B:
         await _handle_key_frame(data[6: 6 + data_len])
+        return
+
+    # INTERCEPT_REQ frame: [0x58][dir][4B seq LE][4B data_len LE][data…]
+    # DLL hook_send/hook_recv'den gelir; proxy onaylayana kadar DLL bekler (≤25 ms).
+    if pkt_type == 0x58:
+        if len(data) < 10:
+            return
+        seq      = struct.unpack_from('<I', data, 2)[0]
+        icpt_len = struct.unpack_from('<I', data, 6)[0]
+        payload  = data[10: 10 + icpt_len]
+
+        loop = asyncio.get_event_loop()
+        fut: asyncio.Future = loop.create_future()
+        session.pending_intercepts[seq] = fut
+
+        await broadcast({
+            'type':    'intercept_req',
+            'seq':     seq,
+            'dir':     direction,
+            'size':    icpt_len,
+            'raw_hex': payload.hex(),
+        })
+
+        # 25 ms timeout — DLL'in timeout'u ile eşleşir
+        try:
+            modified_hex: str | None = await asyncio.wait_for(
+                asyncio.shield(fut), timeout=0.025)
+        except asyncio.TimeoutError:
+            modified_hex = None
+        finally:
+            session.pending_intercepts.pop(seq, None)
+
+        # ICPT_ACK frame: [0x41][dir][4B seq LE][4B data_len LE][data…]
+        # data_len==0 → pass-through (DLL orijinal veriyi kullanır)
+        if modified_hex:
+            try:
+                mod_bytes = bytes.fromhex(modified_hex)
+            except ValueError:
+                mod_bytes = b''
+        else:
+            mod_bytes = b''
+        ack = (bytes([0x41, data[1]])
+               + struct.pack('<I', seq)
+               + struct.pack('<I', len(mod_bytes))
+               + mod_bytes)
+        # ACK'yi isteği gönderen spesifik DLL bağlantısına yolla
+        if dll_ws and not dll_ws.closed:
+            await dll_ws.send_bytes(ack)
         return
 
     # CHALLENGE frame: DLL kayıtlı challenge'ı bağlantıda otomatik gönderir
@@ -1452,6 +1548,39 @@ async def on_ui_cmd(ws, cmd):
             await ws.send_json({'type': 'inject_ok', 'cipher_hex': cipher.hex(), 'size': len(cipher)})
         except Exception as e:
             await ws.send_json({'type': 'inject_error', 'msg': str(e)})
+
+    elif t == 'intercept_mode':
+        # UI intercept modunu aç/kapat; DLL'e ICPT_CFG frame gönderir.
+        # {'type':'intercept_mode', 'enabled': bool, 'dir_mask': int (1=S 2=R 3=both)}
+        enabled   = bool(cmd.get('enabled', False))
+        dir_mask  = int(cmd.get('dir_mask', 3)) & 0xFF
+        session.intercept_mode    = enabled
+        session.intercept_dir_mask = dir_mask
+        # ICPT_CFG: [0x46][dir_mask:1][enabled:1]
+        cfg_frame = bytes([0x46, dir_mask, 1 if enabled else 0])
+        dll = session.dll_ws
+        if dll and not dll.closed:
+            await dll.send_bytes(cfg_frame)
+        await broadcast({'type': 'intercept_status',
+                         'enabled': enabled, 'dir_mask': dir_mask})
+
+    elif t == 'intercept_ack':
+        # UI paketi onayladı/değiştirdi.
+        # {'type':'intercept_ack', 'seq': int, 'hex': str}  (hex=='' → pass-through)
+        seq = cmd.get('seq')
+        hex_mod = cmd.get('hex', '')
+        fut = session.pending_intercepts.get(seq)
+        if fut and not fut.done():
+            fut.set_result(hex_mod if hex_mod else None)
+        else:
+            await ws.send_json({'type': 'status', 'msg': 'intercept seq bulunamadı', 'level': 'warn'})
+
+    elif t == 'intercept_pass':
+        # UI paketi değiştirmeden geçirdi.
+        seq = cmd.get('seq')
+        fut = session.pending_intercepts.get(seq)
+        if fut and not fut.done():
+            fut.set_result(None)
 
     elif t == 'clear':
         session.packets.clear()
@@ -1656,6 +1785,18 @@ tbody tr.sel td{background:#1c2333!important}
 #inj-btn:disabled{opacity:.35;cursor:not-allowed}
 #inj-st{font-size:10px;margin-top:4px;color:var(--gray);min-height:16px}
 #inj-st.ok{color:var(--green)}.inj-st.err{color:var(--red)}
+#icpt-panel{background:var(--bg2);border-top:1px solid var(--border);padding:10px 12px;flex-shrink:0}
+#icpt-panel h3{font-size:10px;color:var(--red);letter-spacing:2px;text-transform:uppercase;margin-bottom:4px;display:flex;align-items:center;gap:6px}
+#icpt-toggle{font-size:9px;padding:2px 8px;border:1px solid var(--red);background:transparent;color:var(--red);border-radius:3px;cursor:pointer}
+#icpt-queue{max-height:180px;overflow-y:auto;display:flex;flex-direction:column;gap:4px}
+.icpt-item{background:var(--bg3);border:1px solid var(--red)55;border-radius:4px;padding:6px 8px;font-size:10px}
+.icpt-item .icpt-hex{font-family:monospace;word-break:break-all;color:var(--fg);margin:4px 0;font-size:9px;max-height:40px;overflow:hidden}
+.icpt-item .icpt-acts{display:flex;gap:4px;margin-top:4px}
+.icpt-item .icpt-mod{flex:1;background:var(--bg3);border:1px solid var(--border);color:var(--fg);font-family:monospace;font-size:9px;padding:2px 4px}
+.icpt-pass{background:transparent;border:1px solid var(--green);color:var(--green);font-size:9px;padding:2px 8px;cursor:pointer;border-radius:2px}
+.icpt-pass:hover{background:var(--green);color:#000}
+.icpt-send{background:transparent;border:1px solid var(--blue);color:var(--blue);font-size:9px;padding:2px 8px;cursor:pointer;border-radius:2px}
+.icpt-send:hover{background:var(--blue);color:#000}
 
 /* Scrollbar */
 ::-webkit-scrollbar{width:5px;height:5px}
@@ -1742,6 +1883,22 @@ tbody tr.sel td{background:#1c2333!important}
       </div>
       <div id="inj-st"></div>
     </div>
+
+    <div id="icpt-panel">
+      <h3>⚡ Intercept Modu
+        <button id="icpt-toggle" onclick="toggleIntercept()" title="Intercept modu aç/kapat">OFF</button>
+        <label style="font-size:10px;margin-left:8px">
+          <input type="checkbox" id="icpt-dir-s" checked> SEND
+        </label>
+        <label style="font-size:10px;margin-left:4px">
+          <input type="checkbox" id="icpt-dir-r" checked> RECV
+        </label>
+      </h3>
+      <p style="font-size:10px;color:var(--gray);margin:2px 0 6px">
+        Aktifken DLL her paketi onay için bekler (≤25 ms).
+      </p>
+      <div id="icpt-queue"></div>
+    </div>
   </div>
 </div>
 
@@ -1797,6 +1954,51 @@ function handle(m) {
     el.textContent = `✗ ${m.msg}`;
     el.className = 'err';
   }
+  else if (m.type === 'intercept_req') { addIcptItem(m); }
+  else if (m.type === 'intercept_status') {
+    const btn = document.getElementById('icpt-toggle');
+    btn.textContent = m.enabled ? 'ON' : 'OFF';
+    btn.style.background = m.enabled ? 'var(--red)' : '';
+    btn.style.color = m.enabled ? '#000' : '';
+  }
+}
+
+// ── Intercept ────────────────────────────────────────────────────────────────
+let icptEnabled = false;
+
+function toggleIntercept() {
+  icptEnabled = !icptEnabled;
+  const s = document.getElementById('icpt-dir-s').checked;
+  const r = document.getElementById('icpt-dir-r').checked;
+  const mask = (s ? 1 : 0) | (r ? 2 : 0);
+  ws && ws.send(JSON.stringify({type:'intercept_mode', enabled:icptEnabled, dir_mask:mask}));
+}
+
+function addIcptItem(m) {
+  const q = document.getElementById('icpt-queue');
+  const div = document.createElement('div');
+  div.className = 'icpt-item';
+  div.id = 'icpt-' + m.seq;
+  const dirLabel = m.dir === 'S' ? '↑ SEND' : '↓ RECV';
+  div.innerHTML = `
+    <b>${dirLabel}</b> seq=${m.seq} size=${m.size}
+    <div class="icpt-hex">${(m.raw_hex||'').slice(0,128)}${m.raw_hex&&m.raw_hex.length>128?'…':''}</div>
+    <div class="icpt-acts">
+      <input class="icpt-mod" id="icpt-mod-${m.seq}" placeholder="modifiye hex (boş=orijinal)">
+      <button class="icpt-pass" onclick="icptResolve(${m.seq},false)">▶ Geçir</button>
+      <button class="icpt-send" onclick="icptResolve(${m.seq},true)">✎ Gönder</button>
+    </div>`;
+  q.appendChild(div);
+  q.scrollTop = q.scrollHeight;
+}
+
+function icptResolve(seq, useModified) {
+  const inp = document.getElementById('icpt-mod-' + seq);
+  const hex = useModified && inp ? inp.value.replace(/\s/g,'') : '';
+  ws && ws.send(JSON.stringify({type: hex ? 'intercept_ack' : 'intercept_pass', seq, hex}));
+  const el = document.getElementById('icpt-' + seq);
+  if (el) el.style.opacity = '0.4';
+  setTimeout(() => el && el.remove(), 1200);
 }
 
 // ── Header state ─────────────────────────────────────────────────────────────

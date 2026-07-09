@@ -721,13 +721,20 @@ static DWORD WINAPI immediate_scan_thread(LPVOID param) {
  * ══════════════════════════════════════════════════════ */
 
 /* Frame başlık boyutu: type(1) dir(1) len_le32(4) = 6 bayt */
+/* ── Standart frame: [type:1][dir:1][len:4][data:len]          (PKT,KEY,CHG) */
+/* ── Intercept frame:[type:1][dir:1][seq:4][len:4][data:len]   (ICPT_REQ/ACK) */
+/* ── Config frame:  [type:1][dir_mask:1][enabled:1]            (ICPT_CFG, 3B) */
 #define PX_HDR          6
-#define PX_TYPE_PKT       0x50u   /* 'P' — paket bildirimi (DLL → Python) */
-#define PX_TYPE_INJ       0x49u   /* 'I' — inject komutu  (Python → DLL)  */
-#define PX_TYPE_KEY       0x4Bu   /* 'K' — BF_KEY frame   (DLL → Python)  */
-#define PX_TYPE_CHALLENGE 0x43u   /* 'C' — challenge frame (DLL → Python)  */
-#define PX_DIR_RECV       0x52u   /* 'R' — sunucudan gelen (recv)          */
-#define PX_DIR_SEND       0x53u   /* 'S' — sunucuya giden  (send)          */
+#define PX_ICPT_HDR    10   /* 1+1+4+4 */
+#define PX_TYPE_PKT       0x50u   /* 'P' — paket bildirimi   (DLL → Python) */
+#define PX_TYPE_INJ       0x49u   /* 'I' — inject komutu    (Python → DLL)  */
+#define PX_TYPE_KEY       0x4Bu   /* 'K' — BF_KEY frame     (DLL → Python)  */
+#define PX_TYPE_CHALLENGE 0x43u   /* 'C' — challenge frame  (DLL → Python)  */
+#define PX_TYPE_ICPT_REQ  0x58u   /* 'X' — intercept istek  (DLL → Python)  */
+#define PX_TYPE_ICPT_ACK  0x41u   /* 'A' — intercept yanıt  (Python → DLL)  */
+#define PX_TYPE_ICPT_CFG  0x46u   /* 'F' — intercept config (Python → DLL)  */
+#define PX_DIR_RECV       0x52u   /* 'R' — sunucudan gelen (recv)            */
+#define PX_DIR_SEND       0x53u   /* 'S' — sunucuya giden  (send)            */
 
 /* ── Kayıtlı challenge (202 byte, 0xc5) ── */
 #define CHALLENGE_SIZE  202
@@ -750,6 +757,22 @@ static INTERNET_PORT g_px_port       = INTERNET_DEFAULT_HTTPS_PORT;
 static wchar_t       g_px_path[256]  = {L"/dll"};
 static BOOL          g_px_tls        = TRUE;
 static BOOL          g_px_enabled    = FALSE;
+static char          g_px_token[256] = {0};  /* pb_proxy.cfg: auth_token= */
+
+/* ── Intercept modu — hook_send/hook_recv paket onayı bekler (≤25 ms) ── */
+static volatile LONG  g_icpt_enabled  = 0;   /* 1 = intercept aktif         */
+static volatile LONG  g_icpt_dir_mask = 3;   /* bit0=SEND bit1=RECV         */
+static volatile LONG  g_icpt_seq_next = 0;   /* monoton artan seq numarası  */
+static CRITICAL_SECTION g_icpt_cs;
+static BOOL           g_icpt_cs_ok   = FALSE;
+static HANDLE         g_icpt_event   = NULL; /* auto-reset olay             */
+static LONG           g_icpt_seq     = -1;   /* bekleyen seq (-1=yok)       */
+static uint8_t       *g_icpt_result  = NULL; /* modify buffer (NULL=pass)   */
+static DWORD          g_icpt_rlen    = 0;    /* modify buffer uzunluğu      */
+/* Meşgul bayrağı: 0=boş 1=slot kullanımda.
+ * CAS ile ayarla — yalnızca bir thread aynı anda intercept yapabilir.
+ * İkinci girişim anında pass-through'a düşer (25 ms beklemez).          */
+static volatile LONG  g_icpt_busy    = 0;
 
 /* ── Runtime ── */
 static volatile LONG g_px_stop       = 0;
@@ -760,8 +783,9 @@ static BOOL          g_px_cs_ok      = FALSE;
 static HANDLE        g_px_thread     = NULL;
 
 /* ── Send Queue (hook thread'leri WinHTTP'ye dokunmaz; sadece enqueue yapar) ──
- * px_send_thread_fn tek başına WinHttpWebSocketSend çağırır → race yok.     */
-#define PXQ_SLOTS  256
+ * px_send_thread_fn tek başına WinHttpWebSocketSend çağırır → race yok.
+ * 4096 slot × ~8 KB = ~32 MB: WebSocket kopmasında paket düşmez.           */
+#define PXQ_SLOTS  4096
 typedef struct { uint8_t *data; DWORD len; } PxQItem;
 static PxQItem          g_pxq[PXQ_SLOTS];
 static volatile LONG    g_pxq_w       = 0;   /* üretici yazar  */
@@ -822,6 +846,26 @@ static BOOL px_read_cfg(void) {
         found = TRUE;
     }
     fclose(f);
+
+    /* 2. Geçiş: auth_token= satırını oku */
+    f = fopen(fpath, "r");
+    if (f) {
+        char line2[1024];
+        while (fgets(line2, sizeof(line2), f)) {
+            char *p = line2;
+            while (*p == ' ' || *p == '\t') p++;
+            if (*p == '#' || *p == '\r' || *p == '\n' || !*p) continue;
+            if (strncmp(p, "auth_token=", 11) == 0) {
+                strncpy(g_px_token, p + 11, sizeof(g_px_token) - 1);
+                for (int i = (int)strlen(g_px_token)-1; i >= 0; i--) {
+                    if (g_px_token[i]=='\r'||g_px_token[i]=='\n'||g_px_token[i]==' ')
+                        g_px_token[i] = 0;
+                    else break;
+                }
+            }
+        }
+        fclose(f);
+    }
     return found;
 }
 
@@ -1019,10 +1063,19 @@ static DWORD WINAPI px_thread_fn(LPVOID param) {
             WinHttpSetOption(req, WINHTTP_OPTION_SECURITY_FLAGS, &sf, sizeof(sf));
         }
 
+        /* Authorization: Bearer <token> (token boşsa header yok) */
+        wchar_t auth_hdr[384] = {0};
+        DWORD   auth_hdr_len  = 0;
+        if (g_px_token[0]) {
+            swprintf(auth_hdr, 384, L"Authorization: Bearer %S\r\n", g_px_token);
+            auth_hdr_len = (DWORD)-1L;
+        }
         BOOL ok =
             WinHttpSetOption(req, WINHTTP_OPTION_UPGRADE_TO_WEB_SOCKET, NULL, 0) &&
-            WinHttpSendRequest(req, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
-                               WINHTTP_NO_REQUEST_DATA, 0, 0, 0) &&
+            WinHttpSendRequest(req,
+                g_px_token[0] ? auth_hdr : WINHTTP_NO_ADDITIONAL_HEADERS,
+                auth_hdr_len,
+                WINHTTP_NO_REQUEST_DATA, 0, 0, 0) &&
             WinHttpReceiveResponse(req, NULL);
 
         if (!ok) {
@@ -1099,6 +1152,37 @@ static DWORD WINAPI px_thread_fn(LPVOID param) {
                         ((fn_send_t)d_send.orig_fn)(
                             gs, (const char*)(rxbuf+PX_HDR), (int)dlen, 0);
                 }
+            }
+
+            /* Intercept ACK: [0x41][dir][4B seq LE][4B data_len LE][data…]
+             * data_len==0 → pass-through (orijinal veriyi kullan)           */
+            else if (rxbuf[0] == PX_TYPE_ICPT_ACK && g_icpt_cs_ok) {
+                if (nread >= PX_ICPT_HDR) {
+                    uint32_t seq, dlen;
+                    memcpy(&seq,  rxbuf + 2, 4);
+                    memcpy(&dlen, rxbuf + 6, 4);
+                    EnterCriticalSection(&g_icpt_cs);
+                    if ((LONG)seq == g_icpt_seq) {
+                        free(g_icpt_result);
+                        g_icpt_result = NULL;
+                        g_icpt_rlen   = 0;
+                        if (dlen > 0 && dlen <= nread - PX_ICPT_HDR) {
+                            g_icpt_result = (uint8_t*)malloc(dlen);
+                            if (g_icpt_result) {
+                                memcpy(g_icpt_result, rxbuf + PX_ICPT_HDR, dlen);
+                                g_icpt_rlen = dlen;
+                            }
+                        }
+                        if (g_icpt_event) SetEvent(g_icpt_event);
+                    }
+                    LeaveCriticalSection(&g_icpt_cs);
+                }
+            }
+
+            /* Intercept CFG: [0x46][dir_mask:1][enabled:1] (3 byte min) */
+            else if (rxbuf[0] == PX_TYPE_ICPT_CFG && nread >= 3) {
+                InterlockedExchange(&g_icpt_dir_mask, rxbuf[1]);
+                InterlockedExchange(&g_icpt_enabled,  rxbuf[2] ? 1 : 0);
             }
         }
 
@@ -1260,6 +1344,19 @@ static void px_shutdown(void) {
     }
     if (g_pxq_cs_ok) { DeleteCriticalSection(&g_pxq_cs); g_pxq_cs_ok = FALSE; }
     if (g_px_key_event) { CloseHandle(g_px_key_event); g_px_key_event = NULL; }
+    /* Intercept temizlik */
+    if (g_icpt_cs_ok) {
+        EnterCriticalSection(&g_icpt_cs);
+        free(g_icpt_result);
+        g_icpt_result = NULL;
+        if (g_icpt_event) {
+            SetEvent(g_icpt_event); /* bekleyen hook_send/recv uyandır */
+        }
+        LeaveCriticalSection(&g_icpt_cs);
+        DeleteCriticalSection(&g_icpt_cs);
+        g_icpt_cs_ok = FALSE;
+    }
+    if (g_icpt_event) { CloseHandle(g_icpt_event); g_icpt_event = NULL; }
 }
 
 /* ══════════════════════════════════════════════════════ */
@@ -1319,55 +1416,109 @@ static int WINAPI hook_connect(SOCKET s,
     return ((fn_connect_t)d_connect.orig_fn)(s, name, namelen);
 }
 
+/*
+ * px_icpt — intercept modu yardımcısı
+ *
+ * Proxy'ye ICPT_REQ gönderir, ≤25 ms bekler.
+ *   • Dönüş != NULL → caller bu buffer'ı kullanmalı, sonra free() etmeli.
+ *   • Dönüş == NULL → pass-through (orijinal veriyi kullan).
+ *
+ * Frame: [0x58][dir][4B seq LE][4B data_len LE][data…]
+ */
+static uint8_t *px_icpt(uint8_t dir, const uint8_t *data, int dlen, DWORD *out_len)
+{
+    if (!g_icpt_cs_ok || !g_icpt_event) return NULL;
+    if (!InterlockedCompareExchange(&g_px_ready, 0, 0)) return NULL;
+    if (dlen <= 0) return NULL;
+
+    /* Tek slot: başka bir thread meşgulse anında pass-through */
+    if (InterlockedCompareExchange(&g_icpt_busy, 1, 0) != 0)
+        return NULL;
+
+    LONG seq = InterlockedIncrement(&g_icpt_seq_next);
+
+    /* Frame oluştur */
+    DWORD flen = (DWORD)(PX_ICPT_HDR + dlen);
+    uint8_t *fbuf = (uint8_t*)malloc(flen);
+    if (!fbuf) return NULL;
+    fbuf[0] = PX_TYPE_ICPT_REQ; fbuf[1] = dir;
+    memcpy(fbuf + 2, &seq, 4);
+    uint32_t u32 = (uint32_t)dlen;
+    memcpy(fbuf + 6, &u32, 4);
+    memcpy(fbuf + PX_ICPT_HDR, data, dlen);
+
+    /* Bekleyen seq'i kaydet ve event'i temizle */
+    EnterCriticalSection(&g_icpt_cs);
+    g_icpt_seq    = seq;
+    free(g_icpt_result);
+    g_icpt_result = NULL;
+    g_icpt_rlen   = 0;
+    ResetEvent(g_icpt_event);
+    LeaveCriticalSection(&g_icpt_cs);
+
+    /* Kuyruğa gönder (px_send_thread_fn WinHTTP'ye yazar) */
+    px_enqueue(fbuf, flen);
+
+    /* Yanıt bekle — en fazla 25 ms */
+    DWORD wr = WaitForSingleObject(g_icpt_event, 25);
+
+    uint8_t *result = NULL;
+    EnterCriticalSection(&g_icpt_cs);
+    g_icpt_seq = -1;
+    if (wr == WAIT_OBJECT_0 && g_icpt_result) {
+        result       = g_icpt_result;
+        *out_len     = g_icpt_rlen;
+        g_icpt_result = NULL;
+        g_icpt_rlen   = 0;
+    }
+    LeaveCriticalSection(&g_icpt_cs);
+    InterlockedExchange(&g_icpt_busy, 0);  /* slotu serbest bırak */
+    return result;  /* caller free() eder */
+}
+
 /* ── HOOK: send (TCP) ── */
 static int WINAPI hook_send(SOCKET s, const char *buf, int len, int flags) {
+    struct sockaddr_in sa; int sl = sizeof(sa);
+    BOOL is_game = (getpeername(s,(struct sockaddr*)&sa,&sl)==0
+                    && ntohs(sa.sin_port)==GAME_PORT);
+
+    /* ── Intercept modu: gerçek gönderimden ÖNCE proxy onayı al ── */
+    if (is_game
+        && InterlockedCompareExchange(&g_icpt_enabled, 0, 0)
+        && (InterlockedCompareExchange(&g_icpt_dir_mask, 0, 0) & 1)) {
+        DWORD mlen = 0;
+        uint8_t *mod = px_icpt(PX_DIR_SEND, (const uint8_t*)buf, len, &mlen);
+        if (mod) {
+            /* Proxy modifiye etti — değiştirilmiş veriyi gönder */
+            int ret2 = ((fn_send_t)d_send.orig_fn)(s, (const char*)mod, (int)mlen, flags);
+            if (ret2 > 0) {
+                px_track(s);
+                px_forward(PX_DIR_SEND, mod, ret2); /* UI'ya bildir */
+            }
+            free(mod);
+            return ret2;
+        }
+        /* Timeout / pass-through → normal akışa devam */
+    }
+
     int ret = ((fn_send_t)d_send.orig_fn)(s, buf, len, flags);
 
-    /* İlk 2 game-server send'de anında tarama — key, send() çağrısından
-     * ÖNCE kurulmuş olması ZORUNLU (şifreli veri hazır). Bu en güvenilir
-     * tarama noktasıdır. */
-    if (ret > 0) {
-        struct sockaddr_in sa; int sl = sizeof(sa);
-        if (getpeername(s, (struct sockaddr*)&sa, &sl) == 0) {
-            uint16_t port = ntohs(sa.sin_port);
-            if (port == GAME_PORT && !memscan_is_done()) {
-                LONG cnt = InterlockedIncrement(&g_send_scan_count);
-                if (cnt <= 2) {
-                    if (g_log_crypto) {
-                        log_time(g_log_crypto);
-                        fprintf(g_log_crypto,
-                            "*** GAME PORT %u SEND #%ld — ANINDA TARAMA (send hook) ***\n",
-                            GAME_PORT, (long)cnt);
-                        fflush(g_log_crypto);
-                    }
-                    HANDLE t = CreateThread(NULL, 0, immediate_scan_thread, NULL, 0, NULL);
-                    if (t) {
-                        LONG idx = InterlockedIncrement(&g_imm_thread_cnt) - 1;
-                        if (idx < MAX_IMM_THREADS) g_imm_threads[idx] = t;
-                        else CloseHandle(t);
-                    }
-                }
+    /* İlk 2 game-server send'de anında tarama */
+    if (ret > 0 && is_game && !memscan_is_done()) {
+        LONG cnt = InterlockedIncrement(&g_send_scan_count);
+        if (cnt <= 2) {
+            HANDLE t = CreateThread(NULL, 0, immediate_scan_thread, NULL, 0, NULL);
+            if (t) {
+                LONG idx = InterlockedIncrement(&g_imm_thread_cnt) - 1;
+                if (idx < MAX_IMM_THREADS) g_imm_threads[idx] = t;
+                else CloseHandle(t);
             }
         }
     }
 
-    if (ret > 0) {
-        struct sockaddr_in sa2; int sl2 = sizeof(sa2);
-        if (getpeername(s,(struct sockaddr*)&sa2,&sl2)==0
-            && ntohs(sa2.sin_port)==GAME_PORT) {
-            px_track(s);
-            px_forward(PX_DIR_SEND, (const uint8_t*)buf, ret);
-        }
-    }
-
-    if (g_log_net && ret > 0) {
-        char peer[64];
-        socket_peer(s, peer, sizeof(peer));
-        log_time(g_log_net);
-        fprintf(g_log_net, "TCP SEND → %-22s  bf_calls=%ld  ",
-                peer, (long)g_bf_export_calls);
-        log_hex(g_log_net, "", (const unsigned char*)buf, ret);
-        fflush(g_log_net);
+    if (ret > 0 && is_game) {
+        px_track(s);
+        px_forward(PX_DIR_SEND, (const uint8_t*)buf, ret);
     }
     return ret;
 }
@@ -1376,64 +1527,51 @@ static int WINAPI hook_send(SOCKET s, const char *buf, int len, int flags) {
 static int WINAPI hook_recv(SOCKET s, char *buf, int len, int flags) {
     int ret = ((fn_recv_t)d_recv.orig_fn)(s, buf, len, flags);
     if (ret > 0) {
-        /* Game server recv → anında bellek taraması (sadece bir kez) */
-        char peer[64];
-        socket_peer(s, peer, sizeof(peer));
-
-        /* "31.169.73." veya port 39190 kontrolü */
         struct sockaddr_in sa; int sl = sizeof(sa);
         if (getpeername(s, (struct sockaddr*)&sa, &sl) == 0) {
             uint16_t port = ntohs(sa.sin_port);
             if (port == GAME_PORT) {
-                /* İlk 3 game-server recv'de anında tarama yap — limit dolmamışsa */
+                /* İlk 3 game-server recv'de anında tarama */
                 LONG cnt = InterlockedIncrement(&g_recv_scan_count);
                 if (cnt <= 3 && !memscan_is_done()) {
                     HANDLE t = CreateThread(NULL, 0, immediate_scan_thread, NULL, 0, NULL);
                     if (t) {
-                        /* Store handle for safe join at DLL_PROCESS_DETACH */
                         LONG idx = InterlockedIncrement(&g_imm_thread_cnt) - 1;
                         if (idx < MAX_IMM_THREADS) g_imm_threads[idx] = t;
                         else CloseHandle(t);
                     }
                 }
-                if (cnt == 1) {
+                if (cnt == 1)
                     InterlockedExchange(&g_game_socket_seen, 1);
-                    if (g_log_crypto) {
-                        log_time(g_log_crypto);
-                        fprintf(g_log_crypto,
-                            "*** PORT %u RECV ALGILANDI — ANI TARAMA TETIKLENIYOR ***\n",
-                            GAME_PORT);
-                        fflush(g_log_crypto);
+
+                /* ── Intercept modu: recv sonrası proxy onayı al ── */
+                if (InterlockedCompareExchange(&g_icpt_enabled, 0, 0)
+                    && (InterlockedCompareExchange(&g_icpt_dir_mask, 0, 0) & 2)) {
+                    DWORD mlen = 0;
+                    uint8_t *mod = px_icpt(PX_DIR_RECV, (const uint8_t*)buf, ret, &mlen);
+                    if (mod) {
+                        /* Modifiye veriyi oyunun buffer'ına kopyala */
+                        int copy = (int)mlen <= len ? (int)mlen : len;
+                        memcpy(buf, mod, copy);
+                        px_forward(PX_DIR_RECV, (const uint8_t*)buf, copy);
+                        free(mod);
+                        return copy;
                     }
                 }
-            }
-        }
 
-        /* Proxy'ye ilet */
-        {
-            struct sockaddr_in sa2; int sl2 = sizeof(sa2);
-            if (getpeername(s,(struct sockaddr*)&sa2,&sl2)==0
-                && ntohs(sa2.sin_port)==GAME_PORT) {
+                /* Normal observe modu */
                 px_forward(PX_DIR_RECV, (const uint8_t*)buf, ret);
-                /* Challenge tespiti: 202B, 0xc5 başlangıcı → kaydet ve ilet.
-                 * g_px_cs ile koru: px_forward_challenge() da aynı CS ile okur. */
+
+                /* Challenge tespiti: 202B, 0xc5 başlangıcı */
                 if (ret == CHALLENGE_SIZE && (uint8_t)buf[0] == 0xc5) {
                     EnterCriticalSection(&g_px_cs);
                     memcpy(g_saved_challenge, buf, CHALLENGE_SIZE);
                     LeaveCriticalSection(&g_px_cs);
                     InterlockedExchange(&g_saved_challenge_len, CHALLENGE_SIZE);
                     InterlockedExchange(&g_challenge_forwarded, 0);
-                    px_forward_challenge(); /* WS hazırsa hemen gönder */
+                    px_forward_challenge();
                 }
             }
-        }
-
-        if (g_log_net) {
-            log_time(g_log_net);
-            fprintf(g_log_net, "TCP RECV ← %-22s  bf_calls=%ld  ",
-                    peer, (long)g_bf_export_calls);
-            log_hex(g_log_net, "", (const unsigned char*)buf, ret);
-            fflush(g_log_net);
         }
     }
     return ret;
@@ -1930,6 +2068,10 @@ static BOOL CALLBACK do_init(PINIT_ONCE p, PVOID param, PVOID *ctx) {
     g_pxq_sem = CreateSemaphoreA(NULL, 0, PXQ_SLOTS, NULL);
     /* Key-ready event (manual-reset, başlangıçta sinyalsiz) */
     g_px_key_event = CreateEventA(NULL, TRUE, FALSE, NULL);
+    /* Intercept kritik bölüm ve auto-reset event */
+    InitializeCriticalSection(&g_icpt_cs);
+    g_icpt_cs_ok = TRUE;
+    g_icpt_event = CreateEventA(NULL, FALSE, FALSE, NULL); /* auto-reset */
     if (px_read_cfg()) {
         g_px_enabled = TRUE;
         if (g_log_net) {
