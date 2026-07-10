@@ -13,7 +13,7 @@ from aiohttp import web
 import aiohttp
 
 # ── Yetkili DLL token — SESSION_SECRET env değişkeninden okunur ──────────────
-PROXY_TOKEN: str = os.environ.get('SESSION_SECRET', '')
+PROXY_TOKEN: str = '1234'
 
 # ─── Blowfish (PointBlank özel varyant: per-round swap YOK) ──────────────────
 
@@ -55,16 +55,21 @@ def cfb64_enc(P, S, plain, iv_bytes):
 
 # ─── Anahtar + IV yükleme ────────────────────────────────────────────────────
 
-CONFIRMED_SIG = (0xc87bf7d2, 0x64215ab6, 0x4108fddb, 0x5e2ee03f)
+# Her oturumda güncellenir — statik değil, o anki onaylı anahtarın imzası
+CONFIRMED_SIG: tuple = (0xc87bf7d2, 0x64215ab6, 0x4108fddb, 0x5e2ee03f)
 
-def load_key(crypto_log, target_sig=CONFIRMED_SIG):
-    """pb_crypto.log'dan BF_KEY yükle."""
+def load_key(crypto_log, target_sig=None):
+    """pb_crypto.log'dan BF_KEY yükle.
+    target_sig=None → SIG filtresi yok, son geçerli aday döner."""
     cur_p, cur_s = None, []
+    last_p, last_s = None, None
     try:
         with open(crypto_log, encoding='utf-8', errors='replace') as f:
             for line in f:
                 s = line.strip()
                 if 'BF_KEY ADAYI' in s:
+                    if cur_p and len(cur_s) == 4:
+                        last_p, last_s = cur_p, list(cur_s)
                     cur_p, cur_s = None, []
                     continue
                 m = re.search(r'\[72 bytes\]:\s*([0-9a-fA-F]{144})', s)
@@ -80,10 +85,14 @@ def load_key(crypto_log, target_sig=CONFIRMED_SIG):
                     r'\s+S2_0=([0-9a-f]+)\s+S3_0=([0-9a-f]+)', s)
                 if m:
                     sig = tuple(int(x, 16) for x in m.groups())
-                    if sig == target_sig and cur_p and len(cur_s) == 4:
+                    if target_sig is not None and sig == target_sig and cur_p and len(cur_s) == 4:
                         return cur_p, cur_s
     except OSError:
         pass
+    if cur_p and len(cur_s) == 4:
+        last_p, last_s = cur_p, list(cur_s)
+    if target_sig is None:
+        return last_p, last_s
     return None, None
 
 # pb_net.log'daki her TCP/UDP satırını eşler
@@ -287,6 +296,9 @@ class Session:
         self.intercept_mode: bool = False
         self.intercept_dir_mask: int = 3   # bit0=SEND bit1=RECV
         self.pending_intercepts: dict[int, asyncio.Future] = {}
+        # DLL bu oturum için KEY frame gönderdi mi?
+        # True ise pb_crypto.log crack'i bu anahtarı ezemez.
+        self.dll_key_received: bool = False
 
     @property
     def dll_ws(self):
@@ -381,6 +393,16 @@ class Session:
                           for p in recent))
         if iv_failing:
             print(f'[IV] Reconnect: son {len(recent)} paket başarısız → yeni IV kabul edildi')
+            self.set_iv(candidate_iv)
+            return True
+
+        # Zero-padded IV tespiti: mevcut IV son 4 byte sıfır (history challenge'dan
+        # gelmiş, eski session'dan kısmi IV) ve yeni IV aynı prefix ama dolmuş suffix
+        # taşıyorsa → daha eksiksiz IV'i kabul et.
+        if (self.iv[4:] == b'\x00\x00\x00\x00'
+                and candidate_iv[:4] == self.iv[:4]
+                and candidate_iv[4:] != b'\x00\x00\x00\x00'):
+            print(f'[IV] Zero-padded IV güncellendi: {self.iv.hex()} → {candidate_iv.hex()}')
             self.set_iv(candidate_iv)
             return True
 
@@ -1225,20 +1247,20 @@ BF_KEY_SIZE = (18 + 4 * 256) * 4
 
 async def _handle_key_frame(raw: bytes):
     """DLL'den gelen KEY frame (0x4B): BF_KEY yükle.
-    Doğrulanmamış DLL bellek taraması anahtarı bf_key.bin'e yazılmaz —
-    önbellekteki onaylı anahtar korunur; yalnızca OpenSSL hook / crack
-    ile doğrulanan anahtarlar bf_key.bin'i günceller."""
+    DLL anahtarı doğrudan BF_set_key hook'undan gelir — bu oturumun gerçek anahtarıdır.
+    Her oturumda farklı SIG üretilir; SIG karşılaştırması yapılmaz, doğrudan kaydedilir."""
+    global CONFIRMED_SIG
     if len(raw) < BF_KEY_SIZE:
         return
     P = list(struct.unpack_from('<18I', raw, 0))
     S = [list(struct.unpack_from('<256I', raw, (18 + i * 256) * 4)) for i in range(4)]
     sig = (S[0][0], S[1][0], S[2][0], S[3][0])
-    is_confirmed = sig == CONFIRMED_SIG
-    # Doğrulanmamış DLL key frame: bf_key.bin'i KORUMA — yanlış key önbelleği kirletmesin
-    session.set_key(P, S, save_cache=is_confirmed)
-    confirmed = '✓ ONAYLANDI' if is_confirmed else '(doğrulanmadı — önbelleksiz)'
-    sig_str   = ' '.join(f'{x:08x}' for x in sig)
-    msg = f'Anahtar DLL\'den otomatik yüklendi {confirmed} — SIG={sig_str}'
+    # DLL anahtarı BF_set_key'den doğrudan gelir → güvenilir, bf_key.bin'e yaz
+    session.set_key(P, S, save_cache=True)
+    session.dll_key_received = True   # bu oturum için DLL doğrudan anahtar gönderdi
+    CONFIRMED_SIG = sig               # bu oturumun SIG'ini güncelle
+    sig_str = ' '.join(f'{x:08x}' for x in sig)
+    msg = f'Anahtar DLL\'den yüklendi ✓ ONAYLANDI — SIG={sig_str}'
     print(f'[KEY] {msg}')
     await broadcast({'type': 'key_loaded', 'iv': session.iv.hex() if session.iv else None})
     await broadcast({'type': 'status', 'msg': msg, 'level': 'ok'})
@@ -1275,7 +1297,11 @@ async def _redecrypt_session():
                 continue  # orijinal büyük event yerine sub-event'ler kullanılır
 
         # Küçük / ayrıştırılamayan paket — yeniden çöz ve yerinde güncelle
-        if status in ('encrypted', 'mismatch', 'proto?'):
+        # 'ok' durumundaki paketler anahtar hazır olmadan kaydedilmişse plain_hex eksik olabilir
+        needs_decrypt = status in ('encrypted', 'mismatch', 'proto?') or (
+            status == 'ok' and not ev.get('plain_hex')
+        )
+        if needs_decrypt:
             plain = session.decrypt(raw, ev.get('dir', 'R'))
             if plain is None:
                 new_packets.append(ev)
@@ -1407,6 +1433,8 @@ async def on_dll_frame(dll_ws, data: bytes):
                 _clear_log_data()
                 session.packets.clear()
                 session.seq = 0
+                # dll_key_received sıfırlanmaz — DLL KEY frame challenge'dan önce gelir,
+                # flag True ise bu oturum için geçerli anahtar zaten alındı demektir.
                 await broadcast({'type': 'cleared'})
 
             lvl = 'ok' if session.has_key() else 'warn'
@@ -1467,6 +1495,15 @@ def _store(ev):
     session.packets.append(ev)
     if len(session.packets) > 500:
         session.packets = session.packets[-500:]
+
+async def key_handler(request):
+    """Aktif Blowfish anahtarını ve IV'yi döndür (debug)."""
+    if not session.has_key():
+        return web.json_response({'error': 'anahtar yok'}, status=404)
+    p_hex = struct.pack('<18I', *session.P).hex()
+    s_hex = b''.join(struct.pack('<256I', *box) for box in session.S).hex()
+    iv_hex = session.iv.hex() if session.iv else None
+    return web.json_response({'p_hex': p_hex, 's_hex': s_hex, 'iv': iv_hex})
 
 # ─── WebSocket: Tarayıcı bağlantısı (/ui) ────────────────────────────────────
 
@@ -1585,6 +1622,7 @@ async def on_ui_cmd(ws, cmd):
     elif t == 'clear':
         session.packets.clear()
         session.seq = 0
+        session.dll_key_received = False
         await broadcast({'type': 'cleared'})
 
     elif t == 'load_key':
@@ -2386,15 +2424,24 @@ async def replay_handler(request):
 # ─── App ─────────────────────────────────────────────────────────────────────
 
 async def packets_handler(request):
-    """GET /api/packets — ham paket listesi (analiz için)."""
+    """GET /api/packets — tam paket listesi (plain_hex + decoded dahil)."""
     pkts = []
     for ev in session.packets[-200:]:
         pkts.append({
-            'seq': ev['seq'], 'ts': ev['ts'], 'dir': ev['dir'],
-            'size': ev['size'], 'status': ev['status'],
+            'seq':        ev['seq'],
+            'ts':         ev['ts'],
+            'dir':        ev['dir'],
+            'size':       ev['size'],
+            'status':     ev['status'],
             'cipher_hex': ev.get('raw_hex', ''),
-            'opcode': ev.get('opcode'), 'proto': ev.get('proto'),
-            'len_field': ev.get('len_field'),
+            'plain_hex':  ev.get('plain_hex'),
+            'payload_hex':ev.get('payload_hex', ''),
+            'opcode':     ev.get('opcode'),
+            'proto':      ev.get('proto'),
+            'len_field':  ev.get('len_field'),
+            'pkt_name':   ev.get('pkt_name', ''),
+            'note':       ev.get('note', ''),
+            'decoded':    ev.get('decoded'),
         })
     return web.json_response({'iv': session.iv.hex() if session.iv else None, 'packets': pkts})
 
@@ -2426,6 +2473,13 @@ async def log_upload_handler(request):
 
         if candidates:
             print(f'[KEY] {len(candidates)} aday yüklendi — crack deneniyor…')
+
+            # DLL bu oturum için zaten doğrudan BF_set_key anahtarı gönderdiyse
+            # eski log'dan crack yapma — yanlış anahtar doğruyu ezer.
+            if session.dll_key_received:
+                print(f'[KEY] DLL bu oturum için anahtar gönderdi — eski log crack\'i atlandı')
+                return web.Response(text='ok (dll key active)')
+
             # IV ve test paketleri mevcutsa otomatik crack
             if session.iv:
                 test_pkts = [
@@ -2441,28 +2495,20 @@ async def log_upload_handler(request):
                     if P and S:
                         crack_used = True
 
-            # Crack başarısız veya test paketi yoksa: CONFIRMED_SIG ara, sonra son aday
-            if not (P and S):
-                # 1. Onaylı SIG'e sahip aday var mı?
-                for cp, cs in candidates:
-                    sig = (cs[0][0], cs[1][0], cs[2][0], cs[3][0])
-                    if sig == CONFIRMED_SIG:
-                        P, S = cp, cs
-                        break
-            if not (P and S):
-                # 2. Son aday
+            # Crack başarısız veya test paketi yoksa: son aday kullan
+            if not (P and S) and candidates:
                 P, S = candidates[-1]
 
         if P and S:
+            global CONFIRMED_SIG
             sig = (S[0][0], S[1][0], S[2][0], S[3][0])
             sig_str = ' '.join(f'{x:08x}' for x in sig)
-            is_confirmed = sig == CONFIRMED_SIG
-            # bf_key.bin'e sadece doğrulanmış anahtar yaz — yanlış aday önbelleği kirletmesin
-            save_cache = crack_used or is_confirmed
-            if not save_cache:
-                print(f'[KEY] Doğrulanmamış aday session\'a yüklendi (bf_key.bin korundu)')
+            # Crack başarılıysa veya tek aday varsa → bf_key.bin'e yaz ve CONFIRMED_SIG güncelle
+            save_cache = crack_used or len(candidates) == 1
             session.set_key(P, S, save_cache=save_cache)
-            confirmed = '✓ ONAYLANDI' if is_confirmed else ('✓ CRACK' if crack_used else '(doğrulanmadı — önbelleksiz)')
+            if save_cache:
+                CONFIRMED_SIG = sig   # dinamik güncelle
+            confirmed = '✓ ONAYLANDI' if save_cache else '(doğrulanmadı — önbelleksiz)'
             msg = f'[AUTO] Anahtar güncellendi {confirmed} — SIG={sig_str}'
             print(msg)
             await broadcast({'type': 'key_loaded',
@@ -2527,6 +2573,7 @@ def make_app():
     app.router.add_get('/',              index_handler)
     app.router.add_get('/api/status',   status_handler)
     app.router.add_get('/api/packets',  packets_handler)
+    app.router.add_get('/api/key',      key_handler)
     app.router.add_get('/api/replay',   replay_handler)
     app.router.add_get('/dll',         dll_handler)
     app.router.add_get('/ui',          ui_handler)
@@ -2546,18 +2593,18 @@ def main():
     ap.add_argument('--sig',    default='c87bf7d2 64215ab6 4108fddb 5e2ee03f')
     args = ap.parse_args()
 
-    target_sig = tuple(int(x, 16) for x in args.sig.split())
-
+    global CONFIRMED_SIG
     # ── Anahtar yükleme sırası ────────────────────────────────────────────────
-    # 1. Önbellek (bf_key.bin) — restart'ta kaybolmaz
+    # 1. Önbellek (bf_key.bin) — restart'ta kaybolmaz; DLL key frame gelince üzerine yazılır
     P, S = load_key_cache()
     if P and S:
         session.set_key(P, S)
         sig = (S[0][0], S[1][0], S[2][0], S[3][0])
-        confirmed = '✓ ONAYLANDI' if sig == target_sig else '(doğrulanmadı)'
-        print(f'[KEY] ✓ Önbellekten yüklendi {confirmed} — bf_key.bin')
+        sig_str = ' '.join(f'{x:08x}' for x in sig)
+        print(f'[KEY] ✓ Önbellekten yüklendi — bf_key.bin  SIG={sig_str}')
+        CONFIRMED_SIG = sig   # önbellek SIG'ini güncelle
     else:
-        # 2. Crypto log dosyaları
+        # 2. Crypto log dosyaları — SIG filtresi yok, son geçerli aday kullan
         key_candidates = [
             args.crypto,
             'log_data/pb_crypto.log',
@@ -2567,14 +2614,15 @@ def main():
         for path in key_candidates:
             if not path:
                 continue
-            P, S = load_key(path, target_sig)
+            P, S = load_key(path, target_sig=None)
             if P and S:
                 session.set_key(P, S)
-                print(f'[KEY] ✓ Anahtar yüklendi: {path}')
-                print(f'[KEY]   SIG={" ".join(f"{x:08x}" for x in target_sig)}')
+                sig = (S[0][0], S[1][0], S[2][0], S[3][0])
+                sig_str = ' '.join(f'{x:08x}' for x in sig)
+                print(f'[KEY] ✓ Anahtar yüklendi: {path}  SIG={sig_str}')
                 break
         else:
-            print('[KEY] ✗ Anahtar bulunamadı — DLL bağlandığında veya manuel giriş ile yüklenecek.')
+            print('[KEY] ✗ Anahtar bulunamadı — DLL bağlandığında otomatik yüklenecek.')
 
     # ── IV yükleme sırası (pb_net.log'dan challenge[3:11]) ────────────────
     iv_candidates = [

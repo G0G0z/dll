@@ -46,6 +46,8 @@ typedef void BIO;
 static FILE *g_log_crypto = NULL;   /* pb_crypto.log  — BF key tarama + OpenSSL çağrıları */
 static FILE *g_log_net    = NULL;   /* pb_net.log     — ham şifreli trafik               */
 static FILE *g_log_plain  = NULL;   /* pb_plain.log   — çözülmüş plaintext paketler      */
+static CRITICAL_SECTION g_log_plain_cs;        /* pb_plain.log yazma kilidi — çoklu thread güvenliği */
+static BOOL             g_log_plain_cs_ok = FALSE;
 
 /* Diagnostic: counts every BF export call — visible in pb_net.log lines */
 static volatile LONG g_bf_export_calls = 0;
@@ -1792,6 +1794,16 @@ static void OSSL_CC hook_BF_cfb64_inline(
         px_forward_challenge(); /* kayıtlı challenge varsa anahtarla birlikte gönder */
     }
 
+    /* ── pb_plain.log: SEND plaintext (enc=1 → 'in' = şifrelenmemiş veri) ── */
+    if (enc == 1 && g_log_plain && in && length > 0) {
+        int seq = (int)InterlockedIncrement(&g_plain_call_seq);
+        if (g_log_plain_cs_ok) EnterCriticalSection(&g_log_plain_cs);
+        log_pb_plain_pkt(g_log_plain, "SEND \xe2\x86\x92",
+                         in, (int)length, seq);
+        log_pb_hexdump(g_log_plain, in, (int)length);
+        if (g_log_plain_cs_ok) LeaveCriticalSection(&g_log_plain_cs);
+    }
+
     if (g_log_crypto) {
         log_time(g_log_crypto);
         fprintf(g_log_crypto, "BF_cfb64 [inline] — %s len=%ld\n",
@@ -1807,6 +1819,16 @@ static void OSSL_CC hook_BF_cfb64_inline(
 
     ((fn_BF_cfb64_t)d_BF_cfb64_inline.orig_fn)(
         in, out, length, key, ivec, num, enc);
+
+    /* ── pb_plain.log: RECV plaintext (enc=0 → 'out' = çözülmüş veri) ── */
+    if (enc == 0 && g_log_plain && out && length > 0) {
+        int seq = (int)InterlockedIncrement(&g_plain_call_seq);
+        if (g_log_plain_cs_ok) EnterCriticalSection(&g_log_plain_cs);
+        log_pb_plain_pkt(g_log_plain, "RECV \xe2\x86\x90",
+                         out, (int)length, seq);
+        log_pb_hexdump(g_log_plain, out, (int)length);
+        if (g_log_plain_cs_ok) LeaveCriticalSection(&g_log_plain_cs);
+    }
 
     if (g_log_crypto && enc == 0) {
         log_hex(g_log_crypto, "out(dec)", out, (int)length);
@@ -2058,6 +2080,10 @@ static BOOL CALLBACK do_init(PINIT_ONCE p, PVOID param, PVOID *ctx) {
 
     /* WinSock inline detour'ları kur */
     install_winsock_hooks();
+
+    /* pb_plain.log yazma kilidi */
+    InitializeCriticalSection(&g_log_plain_cs);
+    g_log_plain_cs_ok = TRUE;
 
     /* ── Python Proxy köprüsü ── */
     InitializeCriticalSection(&g_px_cs);
