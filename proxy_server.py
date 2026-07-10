@@ -427,7 +427,10 @@ class Session:
         return False
 
     def decrypt(self, cipher, direction='R'):
-        """Per-buffer CFB-64 decrypt.
+        """STATEFUL CFB-64 decrypt — akış RECV ve SEND için bağımsız olarak
+        (iv_recv/n_recv, iv_send/n_send) sürdürülür; her paket kendi yönünün
+        akışına devam eder (n_in=0'a resetlenmez). Bu, TCP üzerinde tek bir
+        sürekli CFB-64 stream olan gerçek protokolle eşleşir.
 
         Protokol formatı (wire capture ile doğrulandı):
           cipher[0]  = len_lo          (DÜZ METİN — Blowfish dışı)
@@ -445,25 +448,72 @@ class Session:
         enc_payload = cipher[3:]
         if not enc_payload:
             return bytes(cipher)
-        plain_payload, _, _ = _cfb64(self.P, self.S, enc_payload, self.iv,
-                                     encrypt=False, n_in=0)
+        if direction == 'S':
+            iv_in, n_in = self.iv_send, self.n_send
+        else:
+            iv_in, n_in = self.iv_recv, self.n_recv
+        if iv_in is None:
+            iv_in, n_in = self.iv, 0
+        plain_payload, iv_out, n_out = _cfb64(self.P, self.S, enc_payload, iv_in,
+                                              encrypt=False, n_in=n_in)
+        if direction == 'S':
+            self.iv_send, self.n_send = iv_out, n_out
+        else:
+            self.iv_recv, self.n_recv = iv_out, n_out
         return header + plain_payload
 
-    def decrypt_subpkt(self, raw_subpkt: bytes) -> bytes | None:
-        """Tek bir alt paketin payload'ını bağımsız olarak çöz (walk_subpackets için)."""
+    def decrypt_subpkt(self, raw_subpkt: bytes, direction: str = 'R') -> bytes | None:
+        """Bir alt paketin payload'ını, kendi yönünün (RECV/SEND) sürekli CFB-64
+        akışına devam ederek çöz (walk_subpackets için — n_in sıfırlanmaz)."""
         if not self.has_key() or not self.has_iv() or len(raw_subpkt) < 3:
             return None
         header = raw_subpkt[:3]
         enc_payload = raw_subpkt[3:]
         if not enc_payload:
             return bytes(raw_subpkt)
-        plain_payload, _, _ = _cfb64(self.P, self.S, enc_payload, self.iv,
-                                     encrypt=False, n_in=0)
+        if direction == 'S':
+            iv_in, n_in = self.iv_send, self.n_send
+        else:
+            iv_in, n_in = self.iv_recv, self.n_recv
+        if iv_in is None:
+            iv_in, n_in = self.iv, 0
+        plain_payload, iv_out, n_out = _cfb64(self.P, self.S, enc_payload, iv_in,
+                                              encrypt=False, n_in=n_in)
+        if direction == 'S':
+            self.iv_send, self.n_send = iv_out, n_out
+        else:
+            self.iv_recv, self.n_recv = iv_out, n_out
         return header + plain_payload
 
-    def encrypt(self, plain):
-        """Per-buffer CFB-64 encrypt — sadece payload (plain[3:]) şifrelenir.
-        plain[0:3] (header) düz metin olarak bırakılır."""
+    def decrypt_raw(self, data: bytes, direction: str = 'R') -> bytes:
+        """Header'sız ham baytları, ilgili yönün sürekli akışına devam ederek çöz.
+
+        _walk_subpackets artığı (leftover) gibi geçerli bir paket header'ı
+        olmayan ama akışın bir parçası olan baytlar için kullanılır — böylece
+        bu baytlar atlanmaz ve yön akışının n/iv durumu senkron kalır (aksi
+        halde bir sonraki gerçek paket yanlış anahtar akışı ile decrypt
+        edilir ve 'mismatch' zincirine yol açar)."""
+        if not self.has_key() or not self.has_iv() or not data:
+            return bytes(data)
+        if direction == 'S':
+            iv_in, n_in = self.iv_send, self.n_send
+        else:
+            iv_in, n_in = self.iv_recv, self.n_recv
+        if iv_in is None:
+            iv_in, n_in = self.iv, 0
+        plain, iv_out, n_out = _cfb64(self.P, self.S, data, iv_in,
+                                       encrypt=False, n_in=n_in)
+        if direction == 'S':
+            self.iv_send, self.n_send = iv_out, n_out
+        else:
+            self.iv_recv, self.n_recv = iv_out, n_out
+        return plain
+
+    def encrypt(self, plain, direction: str = 'S'):
+        """STATEFUL CFB-64 encrypt (injection için) — sadece payload (plain[3:])
+        şifrelenir, plain[0:3] (header) düz metin bırakılır. SEND akışının
+        mevcut durumuna (iv_send/n_send) devam eder ki DLL tarafında akış
+        senkron kalsın."""
         if not self.has_key() or not self.has_iv():
             return None
         if len(plain) < 3:
@@ -472,8 +522,18 @@ class Session:
         payload = plain[3:]
         if not payload:
             return bytes(plain)
-        cipher_payload, _, _ = _cfb64(self.P, self.S, payload, self.iv,
-                                      encrypt=True, n_in=0)
+        if direction == 'S':
+            iv_in, n_in = self.iv_send, self.n_send
+        else:
+            iv_in, n_in = self.iv_recv, self.n_recv
+        if iv_in is None:
+            iv_in, n_in = self.iv, 0
+        cipher_payload, iv_out, n_out = _cfb64(self.P, self.S, payload, iv_in,
+                                               encrypt=True, n_in=n_in)
+        if direction == 'S':
+            self.iv_send, self.n_send = iv_out, n_out
+        else:
+            self.iv_recv, self.n_recv = iv_out, n_out
         return header + cipher_payload
 
 session = Session()
@@ -1014,6 +1074,54 @@ def _decode_fields(opcode_byte: int, payload: bytes, direction: str) -> list[dic
                 region = payload[6]
                 f('Bölge kodu', f'0x{region:02x}', 'hex')
 
+        # ── 0x00 UNK_00 (SEND — küçük kontrol paketi, olası ACK/NOP) ─────────
+        elif opcode_byte == 0x00 and len(payload) >= 1:
+            f('Bayt@0', f'0x{payload[0]:02x}', 'hex')
+            if len(payload) >= 4:
+                v = struct.unpack_from('<I', payload, 0)[0]
+                f('Alan@0 (u32)', f'0x{v:08x} ({v})', 'hex')
+
+        # ── 0x30 ROOM_LEAD_CHG ────────────────────────────────────────────────
+        elif opcode_byte == 0x30 and len(payload) >= 2:
+            pid = struct.unpack_from('<H', payload, 0)[0]
+            f('Yeni lider oyuncu ID', f'{pid} (0x{pid:04x})', 'u16')
+
+        # ── 0x36 MAP_DATA ─────────────────────────────────────────────────────
+        elif opcode_byte == 0x36 and len(payload) >= 2:
+            map_id = struct.unpack_from('<H', payload, 0)[0]
+            f('Harita ID', f'{map_id} (0x{map_id:04x})', 'u16')
+            if len(payload) >= 4:
+                extra = struct.unpack_from('<H', payload, 2)[0]
+                f('Alan@2 (u16)', f'0x{extra:04x}', 'hex')
+
+        # ── 0x38 SPECTATE ─────────────────────────────────────────────────────
+        elif opcode_byte == 0x38 and len(payload) >= 2:
+            pid = struct.unpack_from('<H', payload, 0)[0]
+            f('Hedef oyuncu ID', f'{pid} (0x{pid:04x})', 'u16')
+
+        # ── 0x58 SERVER_CFG ───────────────────────────────────────────────────
+        elif opcode_byte == 0x58 and len(payload) >= 4:
+            f('Yapılandırma boyutu', len(payload), 'u32')
+            v = struct.unpack_from('<I', payload, 0)[0]
+            f('Alan@0 (u32)', f'0x{v:08x}', 'hex')
+
+        # ── 0x73 GAME_RULES ───────────────────────────────────────────────────
+        elif opcode_byte == 0x73 and len(payload) >= 1:
+            f('Kural verisi boyutu', len(payload), 'u32')
+            if len(payload) >= 1:
+                ff = payload[0]
+                f('Friendly Fire', 'Açık' if ff else 'Kapalı', 'val')
+
+        # ── 0x7d SOCIAL_DATA ──────────────────────────────────────────────────
+        elif opcode_byte == 0x7d and len(payload) >= 2:
+            cnt = struct.unpack_from('<H', payload, 0)[0]
+            f('Alan@0 (u16, olası kayıt sayısı)', f'{cnt} (0x{cnt:04x})', 'hex')
+
+        # ── 0x8d PERM_UPDATE ──────────────────────────────────────────────────
+        elif opcode_byte == 0x8d and len(payload) >= 1:
+            code = payload[0]
+            f('İzin/ban kodu', f'0x{code:02x}', 'hex')
+
         # ── 0x7b FRIEND_LIST (88 B veya 752 B payload) ───────────────────────
         elif opcode_byte == 0x7b and len(payload) >= 2:
             f('Payload boyutu', len(payload), 'u32')
@@ -1029,6 +1137,51 @@ def _decode_fields(opcode_byte: int, payload: bytes, direction: str) -> list[dic
 
     except Exception:
         pass  # parse hatası → sadece hex dump göster
+
+    # ── Genel yedek (fallback) çözümleyici ──────────────────────────────────
+    # Yukarıdaki özel opcode blokları hiçbir alan üretmediyse (bilinmeyen opcode
+    # veya özel işleyicisi olmayan opcode), payload'ı genel amaçlı olarak
+    # yorumlamayı dene: Pascal string, ardışık sayısal alanlar ve tarama.
+    # Amaç: içerik önizlemesi HER paket için bir şeyler göstersin, sadece
+    # boş kalıp ham hex dump'a düşmesin.
+    if not fields and payload:
+        try:
+            # 1) Pascal-string dene (offset 0) — isim / mesaj / metin alanları için
+            text, off = _try_string(payload, 0)
+            if text is not None:
+                f('Metin@0 (Pascal string, otomatik algılandı)', text, 'str')
+                rest = payload[off:]
+                if rest:
+                    text2, off2 = _try_string(rest, 0)
+                    if text2 is not None:
+                        f('Metin@%d (Pascal string, otomatik algılandı)' % off, text2, 'str')
+                        rest = rest[off2:]
+                if rest:
+                    f('Kalan veri (hex)', rest[:64].hex() + ('…' if len(rest) > 64 else ''), 'hex')
+            else:
+                # 2) Sayısal alan taraması — payload'ın başındaki olası u8/u16/u32/float
+                #    yorumlarını göster; hangisinin anlamlı olduğu manuel incelemeyle belirlenir.
+                if len(payload) >= 1:
+                    f('Bayt@0 (u8, otomatik)', f'0x{payload[0]:02x} ({payload[0]})', 'hex')
+                if len(payload) >= 2:
+                    v16 = struct.unpack_from('<H', payload, 0)[0]
+                    f('Alan@0 (u16 LE, otomatik)', f'0x{v16:04x} ({v16})', 'hex')
+                if len(payload) >= 4:
+                    v32 = struct.unpack_from('<I', payload, 0)[0]
+                    f('Alan@0 (u32 LE, otomatik)', f'0x{v32:08x} ({v32})', 'hex')
+                    fl = struct.unpack_from('<f', payload, 0)[0]
+                    if abs(fl) < 1e7:   # makul float aralığı — anlamsız değerleri gizle
+                        f('Alan@0 (float32, otomatik — makul aralıkta)', f'{fl:.3f}', 'float')
+                if len(payload) >= 12:
+                    x, y, z = struct.unpack_from('<fff', payload, 0)
+                    if all(abs(v) < 1e6 for v in (x, y, z)):
+                        f('Olası konum (x,y,z float32, otomatik)', f'{x:.2f}, {y:.2f}, {z:.2f}', 'float')
+                # 3) Kalan baytların tam hex/ascii özeti — her zaman ekle
+                preview = payload[:96]
+                f('Payload önizleme (hex)', preview.hex() + ('…' if len(payload) > 96 else ''), 'hex')
+                f('Payload önizleme (ascii)', _ascii_safe(preview), 'str')
+        except Exception:
+            pass  # yedek çözümleyici de başarısız olursa sessizce hex dump'a düş
 
     return fields
 
@@ -1142,10 +1295,13 @@ def _walk_subpackets(raw: bytes) -> list[dict]:
     Her alt paketin payload'ı bağımsız olarak n=0'dan çözülür;
     session.decrypt_subpkt() bunu yapar.
 
-    Geçerlilik kuralı (veri kaybı olmadan):
-      • buffer tamamen tüketildi (leftover == 0), VEYA
-      • kalan bayt sayısı < 3 (geçerli bir paket için minimum — padding sayılır).
-    Herhangi bir anlamlı artık varsa (leftover >= 3) split yapılmaz."""
+    Dönüş: (pkts, leftover_bytes)
+      • leftover_bytes: header'ı ayrıştırılamayan artık baytlar (header'sız,
+        akışın parçası) — çağıran bunu decrypt_raw() ile akıştan düşürmeli,
+        aksi halde yön akışı (n_recv/n_send) senkrondan çıkar ve sonraki TÜM
+        paketler 'mismatch' olarak çözülür.
+    Not: pkts boş olsa bile leftover tüm raw'ı içerir — çağıran yine de
+    akışı ilerletmek için decrypt_raw(raw, direction) çağırmalı."""
     pkts = []
     i    = 0
     while i + 3 <= len(raw):
@@ -1169,14 +1325,8 @@ def _walk_subpackets(raw: bytes) -> list[dict]:
         })
         i += total
 
-    if not pkts:
-        return []
-
-    leftover = len(raw) - i
-    # Split yalnızca buffer tamamen tüketildiyse VEYA kalan < 3B (padding)
-    if leftover == 0 or (len(pkts) >= 2 and leftover < 3):
-        return pkts
-    return []   # anlamlı artık var → split yapılmaz, orijinal event korunur
+    leftover_bytes = raw[i:]
+    return pkts, leftover_bytes
 
 # ─── WebSocket: DLL bağlantısı (/dll) ────────────────────────────────────────
 
@@ -1255,11 +1405,22 @@ async def _handle_key_frame(raw: bytes):
     P = list(struct.unpack_from('<18I', raw, 0))
     S = [list(struct.unpack_from('<256I', raw, (18 + i * 256) * 4)) for i in range(4)]
     sig = (S[0][0], S[1][0], S[2][0], S[3][0])
+    is_new_key = (sig != CONFIRMED_SIG)
     # DLL anahtarı BF_set_key'den doğrudan gelir → güvenilir, bf_key.bin'e yaz
     session.set_key(P, S, save_cache=True)
     session.dll_key_received = True   # bu oturum için DLL doğrudan anahtar gönderdi
     CONFIRMED_SIG = sig               # bu oturumun SIG'ini güncelle
     sig_str = ' '.join(f'{x:08x}' for x in sig)
+
+    # YENİ ANAHTAR = YENİ OTURUM: eski IV artık bu anahtarla eşleşmeyebilir
+    # (DLL eski oturumdan kalan bir challenge'ı yeni anahtarla birlikte
+    # yeniden gönderebilir). Eski IV'i atıp gerçek/canlı challenge'ı bekle —
+    # aksi halde tüm paketler "ok" görünür ama içerik çöp (yanlış IV) çözülür.
+    if is_new_key and session.iv is not None:
+        print('[KEY] Yeni anahtar tespit edildi — eski IV geçersiz kılındı, canlı challenge bekleniyor')
+        session.iv = None
+        session._reset_streams()
+
     msg = f'Anahtar DLL\'den yüklendi ✓ ONAYLANDI — SIG={sig_str}'
     print(f'[KEY] {msg}')
     await broadcast({'type': 'key_loaded', 'iv': session.iv.hex() if session.iv else None})
@@ -1273,11 +1434,16 @@ async def _redecrypt_session():
     - Seq numaraları expansion sonrası yeniden atanır."""
     if not session.has_key() or not session.has_iv():
         return
+    # Stream state'i baştan başlat — replay, oturumun en başından itibaren
+    # sırayla yeniden oynatıldığı için RECV/SEND akışları IV'den taze başlamalı.
+    session.iv_recv, session.n_recv = session.iv, 0
+    session.iv_send, session.n_send = session.iv, 0
     new_packets = []
     changed = 0
     for ev in session.packets:
         status = ev.get('status')
         raw    = bytes.fromhex(ev.get('raw_hex', ''))
+        ev_dir = ev.get('dir', 'R')
 
         if status == 'challenge' or not raw:
             new_packets.append(ev)
@@ -1285,15 +1451,23 @@ async def _redecrypt_session():
 
         # Büyük buffer: sub-paket ayrıştırması dene (raw üzerinden — header düz metin)
         if ev.get('size', 0) > 258 and status in ('encrypted', 'mismatch', 'proto?', 'large'):
-            subs = _walk_subpackets(raw)
+            subs, leftover = _walk_subpackets(raw)
             if subs:
                 for sub in subs:
-                    sub_plain = session.decrypt_subpkt(sub['sub_raw'])
+                    sub_plain = session.decrypt_subpkt(sub['sub_raw'], ev_dir)
                     sub_ev = fmt_packet(0, ev['dir'],
                                         sub['sub_raw'], sub_plain, ev['ts'])
                     sub_ev['note'] = f'buf:{len(raw)}B @{sub["offset"]} (retro)'
                     new_packets.append(sub_ev)
                 changed += len(subs)
+                if leftover:
+                    # Header'sız artık — akışı senkron tutmak için tüket, ayrı
+                    # opak event olarak logla (decode edilmez, sadece hex).
+                    session.decrypt_raw(leftover, ev_dir)
+                    trail_ev = fmt_packet(0, ev['dir'], leftover, None, ev['ts'])
+                    trail_ev['status'] = 'trailing'
+                    trail_ev['note']   = f'buf:{len(raw)}B artık {len(leftover)}B (retro, header yok)'
+                    new_packets.append(trail_ev)
                 continue  # orijinal büyük event yerine sub-event'ler kullanılır
 
         # Küçük / ayrıştırılamayan paket — yeniden çöz ve yerinde güncelle
@@ -1472,16 +1646,26 @@ async def on_dll_frame(dll_ws, data: bytes):
     # Header (raw[0:3]) düz metin olduğundan raw üzerinden walk edilir;
     # her alt paketin payload'ı bağımsız olarak decrypt_subpkt ile çözülür.
     if len(raw) > 258 and session.has_key() and session.has_iv():
-        subs = _walk_subpackets(raw)
+        subs, leftover = _walk_subpackets(raw)
         if subs:
             for sub in subs:
-                sub_plain = session.decrypt_subpkt(sub['sub_raw'])
+                sub_plain = session.decrypt_subpkt(sub['sub_raw'], direction)
                 ev = fmt_packet(session.seq, direction,
                                 sub['sub_raw'], sub_plain, ts)
                 ev['note'] = f'buf:{len(raw)}B @{sub["offset"]}'
                 session.seq += 1
                 _store(ev)
                 await broadcast({'type': 'packet', 'pkt': ev})
+            if leftover:
+                # Header'sız artık — akışı senkron tutmak için tüket (decrypt_raw),
+                # ayrı opak event olarak logla (decode edilmez, sadece hex).
+                session.decrypt_raw(leftover, direction)
+                trail_ev = fmt_packet(session.seq, direction, leftover, None, ts)
+                trail_ev['status'] = 'trailing'
+                trail_ev['note']   = f'buf:{len(raw)}B artık {len(leftover)}B (header yok)'
+                session.seq += 1
+                _store(trail_ev)
+                await broadcast({'type': 'packet', 'pkt': trail_ev})
             return
 
     plain = session.decrypt(raw, direction)
@@ -1776,6 +1960,7 @@ tbody tr.sel td{background:#1c2333!important}
 .pb-st-mismatch,.pb-st-encrypted{color:var(--gray);border-color:var(--border)}
 .pb-st-challenge{color:var(--yellow);border-color:var(--yellow)44}
 .pb-st-proto{color:#7dcfff;border-color:#7dcfff44}
+.pb-st-trailing{color:#e0af68;border-color:#e0af6844}
 
 /* Meta row */
 .pkt-meta{padding:6px 12px;border-bottom:1px solid var(--border);display:flex;gap:12px;flex-wrap:wrap}
@@ -2392,14 +2577,20 @@ async def replay_handler(request):
 
         # Büyük tampon: sub-paket ayrıştırması (header düz metin → raw üzerinden walk)
         if session.has_key() and session.has_iv() and p['full'] and size > 258:
-            subs = _walk_subpackets(raw)
+            subs, leftover = _walk_subpackets(raw)
             if subs:
                 for sub in subs:
-                    sub_plain = session.decrypt_subpkt(sub['sub_raw'])
+                    sub_plain = session.decrypt_subpkt(sub['sub_raw'], direction)
                     ev = fmt_packet(session.seq, direction,
                                     sub['sub_raw'], sub_plain, ts)
                     ev['note'] = f'buf:{size}B @{sub["offset"]} (log)'
                     session.seq += 1; _store(ev); evs.append(ev)
+                if leftover:
+                    session.decrypt_raw(leftover, direction)
+                    trail_ev = fmt_packet(session.seq, direction, leftover, None, ts)
+                    trail_ev['status'] = 'trailing'
+                    trail_ev['note']   = f'buf:{size}B artık {len(leftover)}B (log, header yok)'
+                    session.seq += 1; _store(trail_ev); evs.append(trail_ev)
                 continue  # büyük buffer'ı tekil event olarak ekleme
 
         plain = None

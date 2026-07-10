@@ -956,6 +956,13 @@ static void px_forward_key(const uint8_t *bf_key_bytes) {
     memcpy(g_saved_key, bf_key_bytes, BF_KEY_SIZE);
     LeaveCriticalSection(&g_px_cs);
     InterlockedExchange(&g_saved_key_valid, 1);
+
+    /* YENİ ANAHTAR = YENİ OTURUM: eski kayıtlı challenge (ve IV'i) artık geçersiz.
+     * Sıfırlamazsak bir önceki oturumdan kalan g_saved_challenge, bu YENİ anahtarla
+     * birlikte Python'a gönderilir → yanlış IV + doğru anahtar eşleşmesi → tüm
+     * paketler "ok" görünür ama içerik tamamen çöp (rastgele) çözülür. */
+    InterlockedExchange(&g_saved_challenge_len, 0);
+    InterlockedExchange(&g_challenge_forwarded, 0);
     if (g_px_key_event) SetEvent(g_px_key_event); /* px_thread_fn'i uyandır */
 
     /* Bağlantı zaten kurulmuşsa kuyruğa ekle */
